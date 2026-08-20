@@ -560,7 +560,71 @@ chunk 管理本身占用了大量显存（chunk 元数据 + prefetch buffer）�
 checkpoint 后激活显存暴涨，超出单卡上限。gradient checkpointing 在 Gemini
 路径下不可关闭。
 
-### 7.5 结论
+### 7.5 ColossalAI 在 8×H20 上的最优配置探索
+
+为找出 ColossalAI 在 H20 八卡上的最优配置，系统性地探索了 batch size、
+grad-accum、插件类型三个维度的配置空间。
+
+#### 7.5.1 完整配置空间扫描（seq=4096, 8×H20, bf16, gradient checkpointing）
+
+| 配置 | 插件 | micro_bs | grad_accum | stable tok/s | stable TFLOPS | peak mem (alloc) | 状态 |
+|---|---|---|---|---|---|---|---|
+| A | FSDP | 1 | 4 | 2,039 | 329.0 | 65.6 GB | ✅ 基线 |
+| B | FSDP | 2 | 2 | 2,264 | 365.4 | 66.4 GB | ✅ 最优 |
+| C | FSDP | 2 | 4 | 2,269 | 366.2 | 66.4 GB | ✅ 同等 |
+| D | FSDP | 3 | 2 | 2,237 | 360.9 | 70.1 GB | ❌ step2 OOM |
+| E | Gemini | 1 | 4 | 1,832 | 295.7 | 82.1 GB | ✅ |
+| F | Gemini | 2 | 2 | 2,196 | 354.4 | 84.9 GB | ❌ step2 OOM |
+
+#### 7.5.2 关键发现
+
+1. **FSDP bs=2 是最优配置**：吞吐 2,264 tok/s（TFLOPS 365.4），峰值仅 66.4 GB，
+   比 DeepSpeed ZeRO-3 bs=1（2,372 tok/s, 74.6 GB）仅慢 4.5%，但显存省 11%。
+
+2. **grad-accum 对吞吐无影响**（B vs C：2,264 vs 2,269 tok/s，差异 0.2%）。
+   吞吐仅取决于 `micro_bs × seq_len × world_size`。grad-accum 可根据
+   有效 batch size 需求自由调整，不影响性能。
+
+3. **bs=3 是 FSDP 的上限**（D）：step 1 峰值 70.1 GB / 98.3 GB reserved，
+   step 2 即 OOM。FSDP 逐层 wrap 的显存优势在 bs≥3 时被激活显存增长抵消。
+
+4. **Gemini bs=2 不可行**（F）：Gemini chunk 管理本身占 ~84 GB，
+   bs=2 激活增量（+7.58 GB）直接超限。Gemini 路径下 bs=1 是上限。
+
+5. **FSDP 对 batch size 几乎不敏感**（A vs B）：bs=1→2 显存仅增 +0.8 GB，
+   吞吐提升 11%。这是 FSDP 逐层 wrap + shard 释放策略的优势——
+   每层用完即释放 shard，激活显存增长极小。
+
+#### 7.5.3 最优配置推荐
+
+**ColossalAI FSDP 在 8×H20 上的最优配置**：
+
+```bash
+torchrun --nproc_per_node=8 colossalai_train.py \
+    --plugin fsdp \
+    --seq-len 4096 \
+    --batch-size 2 \          # micro_bs=2，FSDP 显存优势最大化
+    --grad-accum 4            # 可按有效 batch 需求调整，不影响吞吐
+```
+
+| 指标 | 值 |
+|---|---|
+| 稳定吞吐 | **2,269 tok/s** |
+| 稳定算力 | **366.2 TFLOPS**（MFU 30.8%） |
+| 峰值显存 | **66.4 GB**（单卡 96 GB，富余 30 GB） |
+| 初始化时间 | **14.5 s** |
+| 显存利用率 | 69.2% |
+
+**对比 DeepSpeed ZeRO-3 最优配置（bs=1, 2,372 tok/s, 74.6 GB）**：
+- 吞吐仅慢 4.5%（2,269 vs 2,372 tok/s）
+- 显存省 11%（66.4 vs 74.6 GB）
+- 初始化快 2×（14.5 vs 30.0 s）
+
+**显存受限场景（micro_bs=2）的压倒性优势**：
+- DeepSpeed ZeRO-3：**OOM**（峰值需求 >95 GB，超单卡 96 GB 上限）
+- ColossalAI FSDP：**跑通**（峰值 66.4 GB，吞吐 2,264 tok/s）
+
+### 7.6 结论
 
 1. **纯训练效率（吞吐/算力）**：DeepSpeed ZeRO-3 更优（2,372 vs 1,832 tok/s，
    领先 29.5%）。DeepSpeed 的 ZeRO-3 实现对参数 allgather / 梯度 reduce 的

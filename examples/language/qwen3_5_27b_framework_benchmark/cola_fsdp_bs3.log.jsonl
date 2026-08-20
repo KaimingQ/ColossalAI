@@ -1,0 +1,1 @@
+{"step": 1, "loss": 13.0322, "tokens_per_s": 2237, "tflops": 360.9, "step_time_s": 87.9, "mem_alloc_gb": 70.1, "mem_resv_gb": 98.3, "lr": 0.0003}
