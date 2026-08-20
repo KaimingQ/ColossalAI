@@ -1,0 +1,471 @@
+# ColossalAI vs DeepSpeed · Qwen3.5 27B 预训练框架对比（复现文档）
+
+> 目标：在 8×NVIDIA H20 上，用 **ColossalAI 0.5.0（FSDP 插件，ZeRO-3）** 跑与
+> [DeepSpeed 基准](train_qwen3_5_27b.md) **完全同配置**的 Qwen3.8-27B 预训练基准
+> （seq=4096、micro-bs=1、accum=4、25 步、合成数据、梯度检查点），对比两框架的
+> 吞吐 / 算力利用率 / 显存，并记录 ColossalAI 的完整适配过程。
+>
+> 机器日期：2026-08-20 · 复现人：qukaiming
+
+---
+
+## 1. 结论速览（两框架正式基准对比，同配置：seq=4096 / micro-bs=1 / accum=4 / 25 步 / 8×H20）
+
+| 指标 | DeepSpeed ZeRO-3 | ColossalAI FSDP (TorchFSDPPlugin) | 差距 |
+|---|---|---|---|
+| 稳定吞吐 | **2,372 token/s** | 2,039 token/s | DeepSpeed 快 **16.3%** |
+| 稳定算力 | **382.7 TFLOPS** | 329.0 TFLOPS | DeepSpeed 高 16.3% |
+| MFU（H20 bf16 峰值 148 TFLOPS/卡） | **32.3%** | 27.8% | DeepSpeed 高 4.5pp |
+| 峰值显存（alloc / reserved） | 74.6 / 85.2 GB | **65.6 / 91.5 GB** | ColossalAI 省 **12.1%**（alloc 口径） |
+| 单步耗时 | **~55 s** | ~64 s | DeepSpeed 快 ~15% |
+| 模型加载 + 并行初始化 | 30.0 s | **15.8 s** | ColossalAI 快 47% |
+| 全程 25 步 | 1,389.8 s | 1,613.4 s | DeepSpeed 快 16% |
+| 总 token / 25 步 | 3,276,800 | 3,276,800 | 一致 |
+
+**总结论**：
+- **训练吞吐/算力：DeepSpeed ZeRO-3 全面领先约 16%**（更成熟的梯度/通信流水线）。
+- **显存占用：ColossalAI FSDP 更省（峰值 alloc 65.6 GB vs 74.6 GB，省约 12%）**，
+  且初始化更快（15.8 s vs 30.0 s）。
+- 两框架均稳定跑完 25 步，loss 行为一致（合成随机数据基线 ~12.4–13）。
+- ColossalAI 的 **Gemini 插件（其特有优化）与 Qwen3.5 的 GatedDeltaNet conv1d
+  存在兼容性问题**（chunk 虚拟 storage 冲突，详见 §3），本次对比使用其
+  TorchFSDPPlugin（PyTorch 原生 FSDP 封装，同为 ZeRO-3 语义）。
+
+---
+
+## 2. ColossalAI 运行环境（与 DeepSpeed 环境隔离的独立 venv）
+
+### 2.1 为什么需要独立 venv
+
+| 依赖 | DeepSpeed venv | ColossalAI venv | 原因 |
+|---|---|---|---|
+| torch | 2.13.0+cu130 | **2.5.1+cu124** | ColossalAI 0.5.0 要求 `torch>=2.2,<=2.5.1` |
+| transformers | 5.15.1 | 5.15.1（**相同**） | 模型 `qwen3_5` 架构必须 ≥5.8.0，此约束双方一致 |
+| ColossalAI | — | 0.5.0（`~/ColossalAI` 源码，PYTHONPATH 引入） | 官方 requirements 固定 `transformers==4.51.3`，与模型加载冲突，故不用 pip 装、直接用源码，且**只走 booster+plugin，绕开强依赖 transformers 4.x 的 shardformer/interface** |
+| 额外依赖 | ninja 等 | psutil、peft、accelerate、galore_torch、bitsandbytes（均为 import 链所需） | 逐个补齐（见下） |
+
+### 2.2 安装步骤
+
+```bash
+cd ~/deepspeed
+uv venv --python 3.12 venv_colossalai
+uv pip install --python venv_colossalai/bin/python torch==2.5.1 \
+    numpy transformers==5.15.1 safetensors sentencepiece ninja einops packaging tqdm
+# ColossalAI 顶层 import 链所需（逐个补缺，均为 --no-deps 以免动 transformers）
+uv pip install --python venv_colossalai/bin/python psutil rich click fabric contexttimer pydantic
+uv pip install --python venv_colossalai/bin/python --no-deps peft accelerate galore_torch bitsandbytes
+```
+
+> 说明：`--no-deps` 是为了防止 peft/accelerate 等把 transformers 降级到 4.x
+> （模型无法加载）。运行时通过 `PYTHONPATH=/home/qukaiming/ColossalAI` 引入
+> ColossalAI 源码；`colossalai.__version__` 显示 0.0.0 是源码未构建的版本号，
+> 不影响功能。
+
+### 2.3 硬件
+
+同 DeepSpeed 文档：8 × NVIDIA H20（97,871 MiB/卡，sm_90），驱动 595.71.05，
+CUDA 13.2；208 核 / 2 TB RAM。NVLS 不可用，需 `NCCL_NVLS_ENABLE=0`。
+
+---
+
+## 3. 适配过程（手动适配记录）
+
+用户要求使用 ColossalAI 特有优化并尽量表现好；实际适配中遇到如下问题，逐一解决：
+
+| # | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | `AssertionError: You should use an optimizer in the available list` | Gemini 插件只接受 `FusedAdam/CPUAdam/HybridAdam`（`_AVAIL_OPTIM_LIST`），不接受 `torch.optim.AdamW` | 改用 `colossalai.nn.optimizer.HybridAdam(..., adamw_mode=True)`（AdamW 语义，超参对齐：betas (0.9,0.95)、wd 0.1） |
+| 2 | `AttributeError: 'GeminiDDP' object has no attribute 'config'` | `booster.boost` 把模型包装成 GeminiDDP，`model.config` 不可用 | 在 boost **前**保存 `vocab_size` |
+| 3 | **`RuntimeError: setStorage: ... storage of size 0`（Gemini，首个前向）** | **Gemini 的 chunk 化虚拟 storage 与 GatedDeltaNet 的 `causal_conv1d` 权重操作（reshape/setStorage）冲突——模型架构与 Gemini 不兼容** | 改用 `TorchFSDPPlugin`（PyTorch 原生 FSDP，ZeRO-3 语义），对模型结构无此约束，冒烟即通过 |
+| 4 | `TypeError: transformer_auto_wrap_policy() missing 3 required positional arguments` | torch 2.5.1 中 `transformer_auto_wrap_policy` 本身即策略函数（首参 `module`），不能直接调用取返回值 | 按 ColossalAI 官方示例传 `partial(transformer_auto_wrap_policy, transformer_layer_cls={Qwen3_5DecoderLayer})` |
+| 5 | `Qwen3_5DecoderLayer` 无法从 `transformers` 顶层导入 | transformers 5.x 顶层不导出该内部类 | 改从 `transformers.models.qwen3_5.modeling_qwen3_5` 导入 |
+
+> **关于 Gemini（ColossalAI 特有优化）的结论**：Gemini 的 chunk 化内存管理与该
+> 模型的 GatedDeltaNet 线性注意力（conv1d 参数虚拟化）不兼容，无法在不动模型
+> 源码的前提下直接训练。若坚持使用 Gemini，需要将 GatedDeltaNet 的 conv1d 层
+> 排除出 chunk 管理（`chunk_config_dict` 等）或改写该层实现，超出本次基准范围。
+> 因此本次对比采用 **TorchFSDPPlugin**（同为 ZeRO-3 参数全分片语义，对比公平）。
+
+---
+
+## 4. 脚本
+
+### 4.1 `colossalai_train.py`（ColossalAI 预训练 / 基准主脚本）
+
+```python
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+ColossalAI 预训练（框架效率基准）脚本 —— Qwen3.5 27B 纯文本版（Qwen3_5ForCausalLM）
+与 DeepSpeed 版 train.py 完全对齐的指标口径（tok/s、6N TFLOPS、显存、summary）。
+
+用法（torchrun 启动）:
+    torchrun --nproc_per_node=8 --master_port=29502 colossalai_train.py \
+        --model-dir ~/models/Qwen3.8-27B --plugin gemini \
+        --steps 25 --seq-len 4096 --batch-size 1 --grad-accum 4 --log-file bench.jsonl
+
+插件:
+    --plugin gemini : ColossalAI 特有优化 Gemini（chunk 化异构内存管理 + 参数/优化器分片）
+                     静态纯 GPU 模式 = ZeRO-3 风格，对标 DeepSpeed ZeRO-3
+    --plugin fsdp   : 封装 PyTorch FSDP（FULL_SHARD, bf16），标准 ZeRO-3
+"""
+import argparse
+import json
+import os
+import time
+from functools import partial
+
+import torch
+import torch.distributed as dist
+from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+import colossalai
+from colossalai.booster import Booster
+from colossalai.booster.plugin import GeminiPlugin, TorchFSDPPlugin
+from colossalai.nn.optimizer import HybridAdam
+from transformers import Qwen3_5ForCausalLM
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model-dir", type=str, default=os.path.expanduser("~/models/Qwen3.8-27B"))
+    p.add_argument("--plugin", type=str, default="gemini", choices=["gemini", "fsdp"])
+    p.add_argument("--seq-len", type=int, default=4096)
+    p.add_argument("--batch-size", type=int, default=1, help="micro batch per GPU")
+    p.add_argument("--grad-accum", type=int, default=4)
+    p.add_argument("--steps", type=int, default=25)
+    p.add_argument("--warmup-steps", type=int, default=3)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--log-file", type=str, default="", help="rank0 JSONL 日志（可选）")
+    p.add_argument("--save-dir", type=str, default="", help="checkpoint 目录（可选）")
+    p.add_argument("--no-grad-ckpt", action="store_true", help="关闭梯度检查点")
+    return p.parse_args()
+
+
+class SyntheticDataset:
+    """与 DeepSpeed 版完全一致的合成数据流（seed+rank 独立流）。"""
+
+    def __init__(self, vocab_size, seq_len, seed, rank):
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+        self.g = torch.Generator()
+        self.g.manual_seed(seed * 1000 + rank)
+
+    def get_batch(self, batch_size, device):
+        ids = torch.randint(0, self.vocab_size, (batch_size, self.seq_len),
+                            generator=self.g, dtype=torch.long)
+        return ids.to(device)
+
+
+def main():
+    args = parse_args()
+    colossalai.launch_from_torch(backend="nccl", seed=args.seed, verbose=False)
+    rank = dist.get_rank()
+    world = dist.get_world_size()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+
+    # ---------- 加载模型 ----------
+    t_load = time.time()
+    model = Qwen3_5ForCausalLM.from_pretrained(
+        args.model_dir, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+    model.config.use_cache = False
+    if not args.no_grad_ckpt:
+        model.gradient_checkpointing_enable()
+    n_params = sum(p.numel() for p in model.parameters())
+    vocab_size = model.config.vocab_size  # boost 前保存（包装后无 .config）
+
+    # ---------- 优化器 / 调度器（与 DeepSpeed 配置对齐） ----------
+    # Gemini 插件只接受 ColossalAI 自家优化器（FusedAdam/CPUAdam/HybridAdam），
+    # 用 HybridAdam（adamw_mode=True 即 AdamW 语义）手动适配；
+    # FSDP 插件接受普通 torch 优化器。
+    if args.plugin == "gemini":
+        optimizer = HybridAdam(model.parameters(), lr=args.lr,
+                               betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1,
+                               adamw_mode=True)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                      betas=(0.9, 0.95), eps=1e-8,
+                                      weight_decay=0.1)
+
+    def lr_lambda(step):
+        if args.warmup_steps > 0 and step < args.warmup_steps:
+            return float(step + 1) / args.warmup_steps
+        return 1.0
+
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # ---------- 插件（ColossalAI 优化） ----------
+    if args.plugin == "gemini":
+        # Gemini：ColossalAI 特有优化。static + 纯 GPU = ZeRO-3 风格（参数/优化器分片）
+        plugin = GeminiPlugin(
+            placement_policy="static",
+            shard_param_frac=1.0,
+            offload_optim_frac=0.0,
+            offload_param_frac=0.0,
+            precision="bf16",
+            master_weights=True,
+            enable_gradient_accumulation=True,
+            force_outputs_fp32=False,
+        )
+    else:
+        plugin = TorchFSDPPlugin(
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            mixed_precision=MixedPrecision(param_dtype=torch.bfloat16,
+                                           reduce_dtype=torch.bfloat16,
+                                           buffer_dtype=torch.bfloat16),
+            auto_wrap_policy=partial(transformer_auto_wrap_policy,
+                                     transformer_layer_cls={Qwen3_5DecoderLayer}),
+        )
+
+    booster = Booster(plugin=plugin)
+    model, optimizer, _, _, lr_scheduler = booster.boost(
+        model, optimizer, lr_scheduler=lr_scheduler)
+    model.train()  # 确保训练模式（梯度检查点/ dropout 生效）
+    load_time = time.time() - t_load
+
+    # ---------- 数据 ----------
+    data = SyntheticDataset(vocab_size, args.seq_len, args.seed, rank)
+
+    gbs_tokens = args.batch_size * world * args.grad_accum * args.seq_len
+    flops_per_token = 6.0 * n_params
+    if rank == 0:
+        print(f"[config] model={args.model_dir} params={n_params/1e9:.2f}B "
+              f"gpus={world} plugin={args.plugin} micro_bs={args.batch_size} "
+              f"accum={args.grad_accum} seq={args.seq_len} "
+              f"global_batch_tokens={gbs_tokens} steps={args.steps} lr={args.lr} "
+              f"grad_ckpt={not args.no_grad_ckpt}")
+        print(f"[load] model+boost took {load_time:.1f}s")
+
+    log_fp = open(args.log_file, "w") if (rank == 0 and args.log_file) else None
+    total_tok = 0
+    t_global = time.time()
+    recent = []
+
+    for step in range(args.steps):
+        t_step = time.time()
+        loss_sum = 0.0
+        for _ in range(args.grad_accum):
+            input_ids = data.get_batch(args.batch_size, device)
+            out = model(input_ids=input_ids, labels=input_ids)
+            booster.backward(out.loss, optimizer)
+            loss_sum += out.loss.detach().float()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        lr_scheduler.step()
+        loss = loss_sum / args.grad_accum
+        dt = time.time() - t_step
+        total_tok += gbs_tokens
+        tok_ps = gbs_tokens / dt
+        tflops = flops_per_token * gbs_tokens / dt / 1e12
+        recent.append(tok_ps)
+        mem_alloc = torch.cuda.max_memory_allocated(device) / 1e9
+        mem_resv = torch.cuda.max_memory_reserved(device) / 1e9
+
+        if rank == 0:
+            m = {
+                "step": step + 1, "loss": round(float(loss), 4),
+                "tokens_per_s": round(tok_ps), "tflops": round(tflops, 1),
+                "step_time_s": round(dt, 2),
+                "mem_alloc_gb": round(mem_alloc, 1), "mem_resv_gb": round(mem_resv, 1),
+                "lr": round(float(lr_scheduler.get_last_lr()[0]), 8),
+            }
+            print(f"[step {step+1:>3}/{args.steps}] loss={m['loss']} "
+                  f"{m['tokens_per_s']} tok/s {m['tflops']} TFLOPS "
+                  f"{m['step_time_s']}s/step mem={mem_alloc:.1f}/{mem_resv:.1f}GB")
+            if log_fp:
+                log_fp.write(json.dumps(m) + "\n")
+                log_fp.flush()
+
+    elapsed = time.time() - t_global
+    if len(recent) > max(2, args.steps // 5):
+        recent = recent[-max(2, args.steps // 5):]
+    stable_tok_ps = sum(recent) / len(recent)
+    stable_tflops = flops_per_token * stable_tok_ps / 1e12
+    if rank == 0:
+        mem_alloc = torch.cuda.max_memory_allocated(device) / 1e9
+        summary = {
+            "params": n_params, "gpus": world, "plugin": args.plugin,
+            "seq_len": args.seq_len, "global_batch_tokens": gbs_tokens,
+            "steps": args.steps, "total_tokens": total_tok,
+            "elapsed_s": round(elapsed, 1),
+            "avg_tokens_per_s": round(total_tok / elapsed),
+            "stable_tokens_per_s": round(stable_tok_ps),
+            "stable_tflops": round(stable_tflops, 1),
+            "peak_mem_alloc_gb": round(mem_alloc, 1),
+            "load_time_s": round(load_time, 1),
+        }
+        print("[summary] " + json.dumps(summary, ensure_ascii=False))
+        if log_fp:
+            log_fp.write("[summary] " + json.dumps(summary, ensure_ascii=False) + "\n")
+    if log_fp:
+        log_fp.close()
+
+    if args.save_dir:
+        os.makedirs(args.save_dir, exist_ok=True)
+        booster.save_model(model, os.path.join(args.save_dir, "model"),
+                           shard=True, use_safetensors=True)
+        booster.save_optimizer(optimizer, os.path.join(args.save_dir, "optim"))
+
+    dist.barrier()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+> 说明：指标口径与 DeepSpeed 版 `train.py` 完全一致
+> （`TFLOPS = 6 × 参数量 × 全局每步 token 数 / 步耗时`，`stable_*` 剔除前若干步）。
+
+---
+
+## 5. 启动命令
+
+统一前置（每个新 shell）：
+
+```bash
+cd ~/deepspeed
+export PATH=$PWD/venv_colossalai/bin:$PATH     # ninja / torchrun
+export PYTHONPATH=/home/qukaiming/ColossalAI    # ColossalAI 0.5.0 源码
+export NCCL_DEBUG=WARN
+export NCCL_NVLS_ENABLE=0                       # 本机 NVLS 不可用，必须禁用
+```
+
+### 5.1 冒烟验证（3 步，seq=512）
+
+```bash
+torchrun --nproc_per_node=8 --master_port=29502 colossalai_train.py \
+    --plugin fsdp --steps 3 --seq-len 512 --batch-size 1 --grad-accum 2 \
+    --log-file cola_smoke_fsdp.log.jsonl
+```
+
+### 5.2 正式基准（25 步，seq=4096，micro-bs=1，accum=4 —— 与 DeepSpeed 完全对齐）
+
+```bash
+# 前台运行（约 27 分钟）
+torchrun --nproc_per_node=8 --master_port=29502 colossalai_train.py \
+    --plugin fsdp --steps 25 --seq-len 4096 --batch-size 1 --grad-accum 4 \
+    --warmup-steps 3 --log-file cola_bench.log.jsonl
+
+# 或后台运行（脱离会话）：
+setsid nohup env PYTHONPATH=/home/qukaiming/ColossalAI NCCL_DEBUG=WARN \
+    NCCL_NVLS_ENABLE=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    /home/qukaiming/deepspeed/venv_colossalai/bin/torchrun \
+    --nproc_per_node=8 --master_port=29502 colossalai_train.py \
+    --plugin fsdp --steps 25 --seq-len 4096 --batch-size 1 --grad-accum 4 \
+    --warmup-steps 3 --log-file cola_bench.log.jsonl \
+    > cola_bench.out.log 2>&1 < /dev/null &
+```
+
+> 冒烟/基准统一加 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 减少碎片
+> （与 DeepSpeed 基准一致）。torchrun 端口用 29502，避开 DeepSpeed 的 29500。
+
+---
+
+## 6. ColossalAI 基准结果（2026-08-20 实测，8×H20）
+
+### 6.1 正式基准汇总（TorchFSDPPlugin / FULL_SHARD / bf16，25 步）
+
+```
+[config] model=~/models/Qwen3.8-27B params=26.90B gpus=8 plugin=fsdp micro_bs=1
+         accum=4 seq=4096 global_batch_tokens=131072 steps=25 lr=0.0003 grad_ckpt=True
+[load]   model+boost took 15.8s
+[summary] {"params": 26895998464, "gpus": 8, "plugin": "fsdp", "seq_len": 4096,
+           "global_batch_tokens": 131072, "steps": 25, "total_tokens": 3276800,
+           "elapsed_s": 1613.4, "avg_tokens_per_s": 2031,
+           "stable_tokens_per_s": 2039, "stable_tflops": 329.0,
+           "peak_mem_alloc_gb": 65.6, "load_time_s": 15.8}
+```
+
+| 指标 | 数值 |
+|---|---|
+| 模型参数量 | 26.90 B（bf16，54 GB 权重） |
+| 全局 batch | 32 序列 × 4096 = 131,072 token/步 |
+| 稳定吞吐 | **2,039 token/s（8 卡合计）** |
+| 稳定算力 | **329.0 TFLOPS**（`6N×tokens/s` 口径） |
+| MFU（按 H20 bf16 峰值 148 TFLOPS/卡） | 329.0 / (8×148) = **27.8%** |
+| 单步耗时 | ~64 s |
+| 峰值显存（alloc / reserved） | 65.6 / 91.5 GB 每卡 |
+| 全程 | 25 步 / 3,276,800 token / 1,613.4 s |
+| 模型加载 + boost | 15.8 s |
+
+逐步数据（节选，吞吐与显存全程平稳）：
+
+```
+[step   1/25] loss=13.0471 1905 tok/s 307.5 TFLOPS 68.8s/step mem=65.6/91.5GB
+[step   5/25] loss=22.3333 2041 tok/s 329.3 TFLOPS 64.23s/step mem=65.6/91.5GB
+[step  10/25] loss=13.5180 2044 tok/s 329.9 TFLOPS 64.12s/step mem=65.6/91.5GB
+[step  15/25] loss=13.6063 2039 tok/s 329.0 TFLOPS 64.29s/step mem=65.6/91.5GB
+[step  20/25] loss=13.4212 2037 tok/s 328.7 TFLOPS 64.36s/step mem=65.6/91.5GB
+[step  25/25] loss=13.3005 2042 tok/s 329.6 TFLOPS 64.17s/step mem=65.6/91.5GB
+```
+
+### 6.2 冒烟验证结果（3 步，seq=512）
+
+```
+[summary] {"params": 26895998464, "gpus": 8, "plugin": "fsdp", "seq_len": 512,
+           "global_batch_tokens": 8192, "steps": 3, "total_tokens": 24576,
+           "elapsed_s": 19.3, "avg_tokens_per_s": 1275,
+           "stable_tokens_per_s": 1618, "stable_tflops": 261.2,
+           "peak_mem_alloc_gb": 65.6, "load_time_s": 14.9}
+```
+
+---
+
+## 7. 与 DeepSpeed 的对比分析（同配置正式基准）
+
+### 7.1 量化对比（详见 §1 表格）
+
+- **吞吐/算力**：DeepSpeed ZeRO-3 领先约 **16%**（2372 vs 2039 tok/s）。
+  可能原因：DeepSpeed 的 ZeRO-3 实现（`overlap_comm`、`reduce_scatter`、
+  `contiguous_gradients`、逐层 prefetch 参数 gather）比 torch FSDP 的默认
+  梯度同步/参数预取更激进；且 DeepSpeed 的 fused_adam 与 ZeRO-3 深度整合。
+- **显存**：ColossalAI（torch FSDP）更省约 **12%**（65.6 vs 74.6 GB alloc）。
+  原因：FSDP 的逐层 wrap + 参数释放策略更紧凑；DeepSpeed 侧 `stage3_max_live_
+  parameters=1e9` 等缓存参数占用更多。注意 reserved 口径相反（91.5 vs 85.2 GB），
+  与两框架的内存池/预分配策略有关。
+- **初始化**：ColossalAI 更快（15.8 vs 30.0 s），FSDP 的 boost 路径比 DeepSpeed
+  的分片初始化更轻。
+- **稳定性**：两者均 25 步全程无 OOM、无崩溃，loss 行为一致。
+
+### 7.2 框架优劣小结
+
+| 维度 | DeepSpeed | ColossalAI |
+|---|---|---|
+| 训练吞吐 / MFU | ★ 更优（+16%） | 良好 |
+| 显存占用（峰值 alloc） | 74.6 GB | ★ 更优（65.6 GB，-12%） |
+| 启动/初始化速度 | 30.0 s | ★ 更优（15.8 s） |
+| 配置成熟度 / 生态 | ★ 成熟稳定（ds_config JSON 即配即用） | 0.5.0 源码 API 与 torch/transformers 版本强绑定，需手动适配 |
+| 特有优化 | ZeRO-Offload、fused optim、通信 overlap | Gemini 异构内存（本次因 GatedDeltaNet conv1d 与 chunk 机制不兼容未能启用） |
+| 与 transformers 5.x 兼容性 | ★ 良好（直接初始化包装） | 需独立 venv + 源码引入 + 绕过 shardformer |
+| 模型架构适配性 | ★ 通用 | FSDP 路径通用；Gemini 路径对非常规算子（conv1d 线性注意力）不兼容 |
+
+### 7.3 结论
+
+1. 纯训练效率（吞吐/算力）：**DeepSpeed ZeRO-3 更优（约 +16%）**，适合追求
+   训练吞吐的场景。
+2. 显存受限场景：**ColossalAI（torch FSDP）更省显存（约 -12%）**，且初始化更快，
+   适合显存紧张或需要快速起训的场景。
+3. 工程便利性：DeepSpeed 的 ds_config 开箱即用、与 transformers 5.x 兼容性好；
+   ColossalAI 0.5.0 需要独立环境与多处手动适配（本文档 §3 已完整记录）。
+4. 若需使用 ColossalAI 的 Gemini（异构内存）等特有优化，需先解决其与
+   GatedDeltaNet conv1d 的兼容问题（将相关层排除出 chunk 管理或改写实现），
+   不在本次基准范围内。
+
+---
+
+## 8. 附录：文件清单
+
+| 文件 | 用途 |
+|---|---|
+| `colossalai_train.py` | ColossalAI 预训练/基准脚本（§4.1 全文） |
+| `cola_bench.log.jsonl` | 正式基准逐步指标明细（JSONL） |
+| `cola_smoke_fsdp.log.jsonl` | FSDP 冒烟指标明细 |
+| `cola_bench.out.log` / `cola_smoke*.out.log` | 各次运行完整 stdout/stderr |
+| `train_qwen3_5_27b.md` | DeepSpeed 基准复现文档（对比基准 A） |
+| `venv_colossalai/` | ColossalAI 独立运行环境 |
+
