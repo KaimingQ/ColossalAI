@@ -27,6 +27,22 @@ Takeaways:
   optimized with `max_prefetch=2` + fused_norm + jit_fused + async_reduce → **+6.6%**.
   Gemini's chunk management overhead (fetch→cast→compute→cast→reduce→return) limits throughput.
 
+### Memory-constrained scenario (micro-bs=2, seq=4096) — ColossalAI's key advantage
+
+| Metric | DeepSpeed ZeRO-3 | ColossalAI FSDP | Winner |
+|---|---|---|---|
+| Can run? | **❌ OOM** (first forward) | **✅ Runs** (5 steps stable) | **ColossalAI** |
+| Stable throughput | — | **2,264 tok/s** | — |
+| Stable compute | — | **365.4 TFLOPS** (MFU 30.8%) | — |
+| Peak GPU mem (alloc) | OOM (>95 GB) | **66.4 GB** | **ColossalAI** |
+| bs=1→bs=2 mem increase | — | only +0.8 GB | — |
+
+**Why ColossalAI wins here**: FSDP's per-layer wrap + shard release strategy is nearly
+insensitive to batch size — activation memory grows minimally. DeepSpeed ZeRO-3's
+`stage3_max_live_parameters` caching strategy pushes peak memory past the 96 GB H20 limit.
+At bs=2, ColossalAI FSDP achieves **2,264 tok/s**, within **4.5%** of DeepSpeed's bs=1
+baseline (2,372 tok/s) — while DeepSpeed cannot run at all.
+
 ## Files
 
 | File | Purpose |

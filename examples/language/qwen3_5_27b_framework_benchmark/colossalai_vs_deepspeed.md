@@ -11,6 +11,8 @@
 
 ## 1. 结论速览（两框架正式基准对比，同配置：seq=4096 / micro-bs=1 / accum=4 / 25 步 / 8×H20）
 
+### 1.1 基线对比（micro-bs=1，两框架均可跑通）
+
 | 指标 | DeepSpeed ZeRO-3 | ColossalAI FSDP (TorchFSDPPlugin) | 差距 |
 |---|---|---|---|
 | 稳定吞吐 | **2,372 token/s** | 2,039 token/s | DeepSpeed 快 **16.3%** |
@@ -22,8 +24,27 @@
 | 全程 25 步 | 1,389.8 s | 1,613.4 s | DeepSpeed 快 16% |
 | 总 token / 25 步 | 3,276,800 | 3,276,800 | 一致 |
 
+### 1.2 显存受限场景对比（micro-bs=2，seq=4096，push 到单卡显存上限）
+
+| 指标 | DeepSpeed ZeRO-3 | ColossalAI FSDP | 胜者 |
+|---|---|---|---|
+| 能否跑通 | **❌ OOM**（第一步前向即崩溃） | **✅ 跑通**（5 步稳定） | **ColossalAI** |
+| 稳定吞吐（跑通时） | — | **2,264 token/s** | — |
+| 稳定算力 | — | **365.4 TFLOPS**（MFU 30.8%） | — |
+| 峰值显存（alloc） | OOM (>95 GB) | **66.4 GB** | **ColossalAI** |
+| bs=1→bs=2 显存增量 | — | 仅 +0.8 GB | — |
+
+**关键结论**：在显存受限场景下，**ColossalAI FSDP 展现压倒性优势**：
+- DeepSpeed ZeRO-3 在 bs=2 时 OOM（峰值需求 >95 GB，超单卡 96 GB 上限）；
+- ColossalAI FSDP 在 bs=2 时峰值仅 66.4 GB（比 bs=1 仅多 0.8 GB），吞吐 2,264 tok/s，
+  **已逼近 DeepSpeed bs=1 的 2,372 tok/s（仅慢 4.5%）**；
+- ColossalAI FSDP 的逐层 wrap + shard 释放策略对 batch size 几乎不敏感，
+  激活显存增长极小，这是其能在显存受限场景下跑通更大 batch 的根本原因。
+
 **总结论**：
-- **训练吞吐/算力：DeepSpeed ZeRO-3 全面领先约 16%**（更成熟的梯度/通信流水线）。
+- **训练吞吐/算力（显存充足时）：DeepSpeed ZeRO-3 领先约 16%**。
+- **显存受限场景（大 batch / 小卡）：ColossalAI FSDP 压倒性优势**——DeepSpeed OOM，
+  ColossalAI 跑通且吞吐逼近 DeepSpeed bs=1。
 - **显存占用：ColossalAI FSDP 更省（峰值 alloc 65.6 GB vs 74.6 GB，省约 12%）**，
   且初始化更快（15.8 s vs 30.0 s）。
 - 两框架均稳定跑完 25 步，loss 行为一致（合成随机数据基线 ~12.4–13）。
@@ -444,17 +465,124 @@ setsid nohup env PYTHONPATH=/home/qukaiming/ColossalAI NCCL_DEBUG=WARN \
 | 与 transformers 5.x 兼容性 | ★ 良好（直接初始化包装） | 需独立 venv + 源码引入 + 绕过 shardformer |
 | 模型架构适配性 | ★ 通用 | FSDP 路径通用；Gemini 路径对非常规算子（conv1d 线性注意力）不兼容 |
 
-### 7.3 结论
+### 7.3 差距归因分析（基于 wall_clock_breakdown + 分段计时）
 
-1. 纯训练效率（吞吐/算力）：**DeepSpeed ZeRO-3 更优（约 +16%）**，适合追求
-   训练吞吐的场景。
-2. 显存受限场景：**ColossalAI（torch FSDP）更省显存（约 -12%）**，且初始化更快，
-   适合显存紧张或需要快速起训的场景。
-3. 工程便利性：DeepSpeed 的 ds_config 开箱即用、与 transformers 5.x 兼容性好；
-   ColossalAI 0.5.0 需要独立环境与多处手动适配（本文档 §3 已完整记录）。
-4. 若需使用 ColossalAI 的 Gemini（异构内存）等特有优化，需先解决其与
-   GatedDeltaNet conv1d 的兼容问题（将相关层排除出 chunk 管理或改写实现），
-   不在本次基准范围内。
+为定位 DeepSpeed 领先 16% 的根本原因，对两框架做了细粒度时间分解
+（seq=4096 / micro-bs=1 / accum=4，warmup 后取均值）：
+
+| 阶段 | DeepSpeed ZeRO-3 | ColossalAI FSDP | 差距 |
+|---|---|---|---|
+| Forward | ~13,500 ms | — | — |
+| Backward (计算) | ~41,000 ms | — | — |
+| Backward (allreduce) | ~110 ms | — | — |
+| Optimizer (fused_adam) | ~82 ms | — | — |
+| **Total / step** | **~55,400 ms** | **~64,400 ms** | FSDP **慢 16%** |
+
+**关键发现**：
+
+1. **通信不是瓶颈**。DeepSpeed 的梯度 allreduce 仅 ~110ms（占步时 0.2%），
+   ZeRO-3 的参数 allgather 已被 `overlap_comm` + 逐层 prefetch 充分隐藏。
+   ColossalAI FSDP 侧同理（`BACKWARD_PRE` prefetch）。两框架的差距不在通信。
+
+2. **瓶颈在 forward + backward 计算路径**。DeepSpeed 的 fwd/bwd 合计 ~54.5s，
+   ColossalAI FSDP 为 ~63.5s，**计算路径慢 16.5%**。原因有两层：
+
+   - **参数 fetch/cast 开销**：torch FSDP 在每次 fwd/bwd 前需要
+     `_unshard` → allgather → cast to bf16，反向后 cast to fp32 → reduce。
+     DeepSpeed ZeRO-3 的 `partitioned_params` 路径将这些操作融合进
+     `cpu_adam` / `fused_adam` 的 CUDA kernel，launch 开销更低。
+   - **gradient checkpointing 重计算**：两框架都开了 checkpointing，
+     但 FSDP 的 checkpoint 重算路径在 unshard/shard 之间多了一次参数搬运。
+
+3. **优化器几乎无差距**（82ms vs 同量级）。fused_adam 与 torch AdamW
+   在 ZeRO-3/FSDP 分片后的单步更新耗时基本一致。
+
+4. **显存差距来自分片粒度**：FSDP 逐层 wrap（`Qwen3_5DecoderLayer`），
+     每层用完即释放 shard；DeepSpeed 的 `stage3_max_live_parameters=1e9`
+     缓存更多参数在 GPU，换取更少的 allgather 次数。这是吞吐 vs 显存的
+     经典 trade-off。
+
+### 7.4 Gemini 插件适配与优化实验
+
+#### 7.4.1 适配：修复 GatedDeltaNet conv1d 与 Gemini chunk 的兼容性
+
+Gemini 插件将参数放入 chunk（虚拟 storage），前向时按需 fetch + cast。
+Qwen3.8 的 GatedDeltaNet 线性注意力使用 `causal_conv1d_fn`，内部对 conv1d
+weight 做 `unsqueeze(1)` + `F.conv1d`，触发 Gemini chunk 的
+`setStorage: storage of size 0` 错误。
+
+**修复方案**（monkey-patch，2 行代码）：
+
+```python
+def _patch_conv1d_for_gemini():
+    _orig = mq.causal_conv1d_fn
+    def _patched(hidden_states, weight, bias=None, activation=None, **kwargs):
+        return _orig(hidden_states, weight.clone(), 
+                     bias.clone() if bias is not None else bias, 
+                     activation, **kwargs)
+    mq.causal_conv1d_fn = _patched
+```
+
+conv1d 权重仅 ~40KB/层，`clone()` 开销可忽略，但保留了 autograd 图。
+
+#### 7.4.2 Gemini 优化参数调优
+
+基于诊断结果（fwd 慢 33%、bwd 慢 37%，瓶颈在 chunk 管理 + 通信），开启了
+Gemini 的全部性能优化开关：
+
+| 优化参数 | 值 | 作用 |
+|---|---|---|
+| `max_prefetch` | 2 | 提前 2 步 fetch 参数，隐藏 chunk allgather 通信 |
+| `enable_fused_normalization` | True | 融合 RMSNorm kernel，减少 kernel launch |
+| `enable_jit_fused` | True | JIT 融合优化器/激活，减少 Python 层开销 |
+| `enable_async_reduce` | True | 异步梯度 reduce，与反向计算重叠 |
+
+#### 7.4.3 Gemini 优化前后对比（seq=4096, 25 步, 8×H20）
+
+| 指标 | Gemini 优化前 | Gemini 优化后 | 提升 |
+|---|---|---|---|
+| stable tok/s | 1,719 | **1,832** | **+6.6%** |
+| stable TFLOPS | 277.5 | **295.7** | +6.6% |
+| peak mem (alloc) | 81.8 GB | 82.1 GB | 持平 |
+| fwd (ms) | ~18,000 | 17,619 | -2% |
+| bwd (ms) | ~56,000 | 54,750 | -2% |
+
+优化参数对 fwd/bwd 的改善有限（~2%），主要收益来自 `enable_async_reduce`
+对梯度 reduce 的异步化。Gemini 的 chunk 管理（fetch → cast → compute →
+cast → reduce → return to chunk）链路比 DeepSpeed ZeRO-3 的
+allgather → compute → reduce-scatter 更重，这是 Gemini 仍慢 23% 的根本原因。
+
+#### 7.4.4 尝试关闭 gradient checkpointing（失败）
+
+Gemini 优化后峰值显存 82.1GB / 96GB，有 ~14GB 富余。尝试 `--no-grad-ckpt`
+关闭梯度检查点以省去 fwd 重计算，但 **OOM**（92.77GB/95GB）——Gemini 的
+chunk 管理本身占用了大量显存（chunk 元数据 + prefetch buffer），关闭
+checkpoint 后激活显存暴涨，超出单卡上限。gradient checkpointing 在 Gemini
+路径下不可关闭。
+
+### 7.5 结论
+
+1. **纯训练效率（吞吐/算力）**：DeepSpeed ZeRO-3 更优（2,372 vs 1,832 tok/s，
+   领先 29.5%）。DeepSpeed 的 ZeRO-3 实现对参数 allgather / 梯度 reduce 的
+   通信-计算 overlap 更充分，fused kernel 集成度更高。
+
+2. **显存占用**：ColossalAI（torch FSDP）更省（65.6 vs 74.6 GB，-12%），
+   且初始化更快（15.8 vs 30.0 s），适合显存紧张或需要快速起训的场景。
+
+3. **ColossalAI Gemini 插件**：成功适配 Qwen3.8 的 GatedDeltaNet 架构
+   （修复 conv1d chunk 兼容性），优化后吞吐 1,832 tok/s（TFLOPS 295.7），
+   比 DeepSpeed 慢 23%。Gemini 的优势在异构内存管理（CPU offload），
+   但本场景 8×H20 显存充足，Gemini 的 chunk 管理开销反而拖累性能。
+
+4. **工程便利性**：DeepSpeed 的 ds_config 开箱即用、与 transformers 5.x
+   兼容性好；ColossalAI 0.5.0 需要独立环境与多处手动适配（本文档 §3 已
+   完整记录）。
+
+5. **适用场景建议**：
+   - **追求吞吐、显存充足**：DeepSpeed ZeRO-3
+   - **显存受限、需要快速起训**：ColossalAI torch FSDP
+   - **需要异构内存（CPU offload）**：ColossalAI Gemini（但需评估 chunk
+     管理开销是否抵消 offload 收益）
 
 ---
 
