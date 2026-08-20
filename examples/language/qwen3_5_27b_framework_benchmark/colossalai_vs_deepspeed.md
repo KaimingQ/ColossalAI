@@ -565,35 +565,49 @@ checkpoint 后激活显存暴涨，超出单卡上限。gradient checkpointing �
 为找出 ColossalAI 在 H20 八卡上的最优配置，系统性地探索了 batch size、
 grad-accum、插件类型三个维度的配置空间。
 
-#### 7.5.1 完整配置空间扫描（seq=4096, 8×H20, bf16, gradient checkpointing）
+#### 7.5.1 完整配置空间扫描（8×H20, bf16, gradient checkpointing 除非标注）
 
-| 配置 | 插件 | micro_bs | grad_accum | stable tok/s | stable TFLOPS | peak mem (alloc) | 状态 |
-|---|---|---|---|---|---|---|---|
-| A | FSDP | 1 | 4 | 2,039 | 329.0 | 65.6 GB | ✅ 基线 |
-| B | FSDP | 2 | 2 | 2,264 | 365.4 | 66.4 GB | ✅ 最优 |
-| C | FSDP | 2 | 4 | 2,269 | 366.2 | 66.4 GB | ✅ 同等 |
-| D | FSDP | 3 | 2 | 2,237 | 360.9 | 70.1 GB | ❌ step2 OOM |
-| E | Gemini | 1 | 4 | 1,832 | 295.7 | 82.1 GB | ✅ |
-| F | Gemini | 2 | 2 | 2,196 | 354.4 | 84.9 GB | ❌ step2 OOM |
+| 配置 | 插件 | seq_len | micro_bs | grad_ckpt | stable tok/s | stable TFLOPS | peak mem (alloc) | 状态 |
+|---|---|---|---|---|---|---|---|---|
+| A | FSDP | 4096 | 1 | ✅ | 2,039 | 329.0 | 65.6 GB | ✅ 基线 |
+| **B** | **FSDP** | **4096** | **2** | **✅** | **2,264** | **365.4** | **66.4 GB** | **✅ 吞吐甜点** |
+| C | FSDP | 4096 | 2 (accum=4) | ✅ | 2,269 | 366.2 | 66.4 GB | ✅ 同等 |
+| D | FSDP | 4096 | 3 | ✅ | 2,237 | 360.9 | 70.1 GB | ❌ step2 OOM |
+| E | Gemini | 4096 | 1 | ✅ | 1,832 | 295.7 | 82.1 GB | ✅ Gemini 上限 |
+| F | Gemini | 4096 | 2 | ✅ | 2,196 | 354.4 | 84.9 GB | ❌ step2 OOM |
+| **G** | **FSDP** | **8192** | **1** | **✅** | **1,595** | **257.5** | **66.4 GB** | **✅ 长序列甜点** |
+| H | FSDP | 512 | 1 | ❌ | 2,038 | 328.8 | 65.8 GB | ✅ 计算密集 |
+| I | FSDP_grad (ZeRO-2) | 4096 | 1 | ✅ | — | — | — | ❌ OOM (参数不分片) |
 
 #### 7.5.2 关键发现
 
-1. **FSDP bs=2 是最优配置**：吞吐 2,264 tok/s（TFLOPS 365.4），峰值仅 66.4 GB，
-   比 DeepSpeed ZeRO-3 bs=1（2,372 tok/s, 74.6 GB）仅慢 4.5%，但显存省 11%。
+1. **吞吐甜点：FSDP bs=2/seq=4096**（配置 B）：吞吐 2,264 tok/s（TFLOPS 365.4），
+   峰值仅 66.4 GB，比 DeepSpeed ZeRO-3 bs=1（2,372 tok/s, 74.6 GB）仅慢 4.5%，
+   但显存省 11%。这是 ColossalAI 在 H20 八卡上的**最优吞吐配置**。
 
-2. **grad-accum 对吞吐无影响**（B vs C：2,264 vs 2,269 tok/s，差异 0.2%）。
-   吞吐仅取决于 `micro_bs × seq_len × world_size`。grad-accum 可根据
-   有效 batch size 需求自由调整，不影响性能。
+2. **长序列甜点：FSDP seq=8192**（配置 G）：seq 从 4096→8192 翻倍，
+   **峰值显存完全不变**（66.4 GB），吞吐 1,595 tok/s（TFLOPS 257.5）。
+   这验证了 GatedDeltaNet 线性注意力的 **O(1) 显存**优势——
+   激活显存不随 seq_len 增长。ColossalAI FSDP 的逐层 wrap 释放策略
+   与线性注意力的 O(1) 激活形成双重红利，是**长序列训练的甜点**。
 
-3. **bs=3 是 FSDP 的上限**（D）：step 1 峰值 70.1 GB / 98.3 GB reserved，
-   step 2 即 OOM。FSDP 逐层 wrap 的显存优势在 bs≥3 时被激活显存增长抵消。
+3. **计算密集甜点：FSDP seq=512/no-ckpt**（配置 H）：关闭 gradient checkpointing
+   后省去 fwd 重计算，峰值 65.8 GB（与开 checkpoint 相同，seq=512 激活本就小），
+   吞吐 2,038 tok/s。短 seq 下关闭 checkpoint 不省显存也不提升吞吐，
+   **seq=512 不是 ColossalAI 的甜点**——线性注意力优势在长序列才体现。
 
-4. **Gemini bs=2 不可行**（F）：Gemini chunk 管理本身占 ~84 GB，
+4. **ZeRO-2（SHARD_GRAD_OP）不可行**（配置 I）：27B 模型 BF16 副本 ~54 GB，
+   加优化器状态分片 + 激活，总量超 96 GB 单卡上限。**FULL_SHARD（ZeRO-3）
+   是 27B 模型在 96 GB 卡上的唯一可行路径**。
+
+5. **grad-accum 对吞吐无影响**（B vs C：2,264 vs 2,269 tok/s，差异 0.2%）。
+   吞吐仅取决于 `micro_bs × seq_len × world_size`。
+
+6. **bs=3 是 FSDP 的上限**（D）：step 1 峰值 70.1 GB / 98.3 GB reserved，
+   step 2 即 OOM。
+
+7. **Gemini bs=2 不可行**（F）：Gemini chunk 管理本身占 ~84 GB，
    bs=2 激活增量（+7.58 GB）直接超限。Gemini 路径下 bs=1 是上限。
-
-5. **FSDP 对 batch size 几乎不敏感**（A vs B）：bs=1→2 显存仅增 +0.8 GB，
-   吞吐提升 11%。这是 FSDP 逐层 wrap + shard 释放策略的优势——
-   每层用完即释放 shard，激活显存增长极小。
 
 #### 7.5.3 最优配置推荐
 

@@ -1,0 +1,6 @@
+{"step": 1, "loss": 13.1626, "tokens_per_s": 1301, "tflops": 209.9, "step_time_s": 12.6, "mem_alloc_gb": 65.6, "mem_resv_gb": 88.0, "lr": 0.0003}
+{"step": 2, "loss": 17.112, "tokens_per_s": 2069, "tflops": 333.9, "step_time_s": 7.92, "mem_alloc_gb": 65.8, "mem_resv_gb": 88.0, "lr": 0.0003}
+{"step": 3, "loss": 20.783, "tokens_per_s": 2017, "tflops": 325.4, "step_time_s": 8.12, "mem_alloc_gb": 65.8, "mem_resv_gb": 88.0, "lr": 0.0003}
+{"step": 4, "loss": 30.7527, "tokens_per_s": 2056, "tflops": 331.8, "step_time_s": 7.97, "mem_alloc_gb": 65.8, "mem_resv_gb": 88.0, "lr": 0.0003}
+{"step": 5, "loss": 16.5708, "tokens_per_s": 2019, "tflops": 325.8, "step_time_s": 8.11, "mem_alloc_gb": 65.8, "mem_resv_gb": 88.0, "lr": 0.0003}
+[summary] {"params": 26895998464, "gpus": 8, "plugin": "fsdp", "seq_len": 512, "global_batch_tokens": 16384, "steps": 5, "total_tokens": 81920, "elapsed_s": 44.7, "avg_tokens_per_s": 1831, "stable_tokens_per_s": 2038, "stable_tflops": 328.8, "peak_mem_alloc_gb": 65.8, "load_time_s": 14.0, "fwd_ms": 2366, "bwd_ms": 5631, "opt_ms": 68, "zero_ms": 0}
