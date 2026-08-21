@@ -1,0 +1,26 @@
+{"step": 1, "loss": 13.0471, "tokens_per_s": 1903, "tflops": 307.1, "step_time_s": 68.87, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0002}
+{"step": 2, "loss": 12.993, "tokens_per_s": 2048, "tflops": 330.5, "step_time_s": 63.99, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 3, "loss": 13.0097, "tokens_per_s": 2030, "tflops": 327.7, "step_time_s": 64.56, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 4, "loss": 13.0293, "tokens_per_s": 2033, "tflops": 328.1, "step_time_s": 64.46, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 5, "loss": 13.0189, "tokens_per_s": 2031, "tflops": 327.8, "step_time_s": 64.52, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 6, "loss": 13.0242, "tokens_per_s": 2033, "tflops": 328.1, "step_time_s": 64.47, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 7, "loss": 13.0108, "tokens_per_s": 2029, "tflops": 327.4, "step_time_s": 64.61, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 8, "loss": 13.0213, "tokens_per_s": 2027, "tflops": 327.0, "step_time_s": 64.68, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 9, "loss": 13.0099, "tokens_per_s": 2028, "tflops": 327.3, "step_time_s": 64.63, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 10, "loss": 13.007, "tokens_per_s": 2027, "tflops": 327.1, "step_time_s": 64.66, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 11, "loss": 13.0142, "tokens_per_s": 2038, "tflops": 328.8, "step_time_s": 64.32, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 12, "loss": 12.9939, "tokens_per_s": 2027, "tflops": 327.0, "step_time_s": 64.68, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 13, "loss": 13.0038, "tokens_per_s": 2030, "tflops": 327.6, "step_time_s": 64.57, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 14, "loss": 13.0151, "tokens_per_s": 2019, "tflops": 325.8, "step_time_s": 64.92, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 15, "loss": 13.0289, "tokens_per_s": 2031, "tflops": 327.8, "step_time_s": 64.53, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 16, "loss": 12.9991, "tokens_per_s": 2031, "tflops": 327.8, "step_time_s": 64.52, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 17, "loss": 12.9986, "tokens_per_s": 2028, "tflops": 327.2, "step_time_s": 64.65, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 18, "loss": 12.9921, "tokens_per_s": 2023, "tflops": 326.5, "step_time_s": 64.79, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 19, "loss": 13.0038, "tokens_per_s": 2028, "tflops": 327.2, "step_time_s": 64.64, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 20, "loss": 13.0002, "tokens_per_s": 2024, "tflops": 326.7, "step_time_s": 64.75, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 21, "loss": 13.0264, "tokens_per_s": 2034, "tflops": 328.2, "step_time_s": 64.44, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 22, "loss": 13.0052, "tokens_per_s": 2029, "tflops": 327.5, "step_time_s": 64.59, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 23, "loss": 12.9883, "tokens_per_s": 2028, "tflops": 327.3, "step_time_s": 64.63, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 24, "loss": 13.0043, "tokens_per_s": 2031, "tflops": 327.8, "step_time_s": 64.53, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+{"step": 25, "loss": 13.0198, "tokens_per_s": 2031, "tflops": 327.7, "step_time_s": 64.55, "mem_alloc_gb": 90.3, "mem_resv_gb": 99.1, "lr": 0.0003}
+[summary] {"params": 26895998464, "gpus": 8, "mode": "fsdp", "seq_len": 4096, "global_batch_tokens": 131072, "steps": 25, "total_tokens": 3276800, "elapsed_s": 1618.6, "avg_tokens_per_s": 2024, "stable_tokens_per_s": 2031, "stable_tflops": 327.7, "peak_mem_alloc_gb": 90.3, "load_time_s": 13.2, "fwd_ms": 12177, "bwd_ms": 52414, "opt_ms": 1, "zero_ms": 0}
