@@ -4,20 +4,22 @@
 >
 > **测试硬件**：NVIDIA H20-SXM4-96GB（驱动 595.71.05，CUDA 13.2 / PyTorch 2.5.1 / 2.13.0）  
 > **评测模型**：
-> 1. `Qwen3.5-9B` (8.95B 参数，BF16 权重 18GB，单卡全量/微调主力)
+> 1. `Qwen3.5-9B` (8.95B 参数，BF16 权重 18GB，单卡全量 SFT / LoRA / 预训练评测)
 > 2. `Qwen3.8-27B` (26.90B 参数，BF16 权重 54GB，单卡 LoRA 微调 / 四卡 / 八卡评测主力)
-> 3. `gemma-4-31B` (31.27B 参数，BF16 权重 62.5GB，四卡稠密大模型评测)
+> 3. `gemma-4-31B` (31.27B 参数，BF16 权重 62.5GB，单卡 LoRA 微调 / 四卡稠密大模型评测)
 
 ---
 
-## 1. 核心评测结论与矩阵汇总
+## 1. 核心评测结论与全景矩阵汇总
 
 ### 1.1 实验全景矩阵（预训练 + 微调全场景）
 
 | 实验场景 | 模型规模与任务 | DeepSpeed ZeRO (纯 GPU 模式) | DeepSpeed ZeRO (CPU Offload 模式) | ColossalAI (纯 GPU 零 Offload) | 核心对比结论与优势倍数 |
 |---|---|---|---|---|---|
-| **【微调】单卡 27B 大模型 LoRA (1×H20)** | **Qwen3.8-27B**<br>(26.90B, LoRA r=16, seq=1024) | **❌ OOM 崩溃**<br>(显存需求 >93.6GB) | ⚠️ 吞吐严重受限 | **✅ 纯 GPU 满血跑通**<br>显存仅 **55.6 GB** (余量 40GB)<br>吞吐: **353 tok/s**<br>算力: **28.5 TFLOPS** | **ColossalAI 唯一跑通方案**：<br>• 单张 H20 即可微调 27B 大模型<br>• DeepSpeed 纯 GPU 直接崩溃 |
+| **【微调】单卡 27B 大模型 LoRA (1×H20)** | **Qwen3.8-27B**<br>(26.90B, LoRA r=16, seq=1024) | **❌ OOM 崩溃**<br>(显存需求 >93.6GB) | **❌ OOM / 失败**<br>(Offload 扁平梯度缓存超限) | **✅ 纯 GPU 满血跑通**<br>显存仅 **55.6 GB** (余量 40.5GB)<br>吞吐: **353 tok/s**<br>算力: **28.5 TFLOPS** | **ColossalAI 唯一跑通方案**：<br>• 单张 H20 即可微调 27B 大模型<br>• DeepSpeed 纯 GPU 与 Offload 均崩溃 |
+| **【微调】单卡 31B 稠密 LoRA (1×H20)** | **gemma-4-31B**<br>(31.27B, LoRA r=16, seq=512) | **✅ 跑通**<br>显存: **77.2 GB**<br>吞吐: 693 tok/s | — | **✅ 跑通**<br>显存: **62.9 GB**<br>吞吐: 462 tok/s | **ColossalAI 显存节省 18.5%**：<br>• 显存直降 **14.3 GB**<br>• 留出 33.1GB 显存扩展长上下文 |
 | **【微调】单卡 9B LoRA 微调 (1×H20)** | **Qwen3.5-9B**<br>(8.95B, LoRA r=16, seq=1024) | **✅ 跑通**<br>显存: **38.5 GB**<br>吞吐: 974 tok/s | — | **✅ 跑通**<br>显存: **20.9 GB**<br>吞吐: 704 tok/s | **ColossalAI 显存节省 45.7%**：<br>• 显存直降 **17.6 GB**<br>• 支持 3 倍更大 Batch 或超长序列 |
+| **【微调】单卡 9B 全量 SFT (1×H20, Offload)** | **Qwen3.5-9B**<br>(8.95B Full SFT, seq=512) | **❌ OOM 崩溃**<br>(单卡全量优化器 >108GB) | **⚠️ 勉强能跑**<br>吞吐: **163 tok/s**<br>算力: 8.8 TFLOPS<br>加载: **58.1s** | **✅ FSDP Offload 跑通**<br>吞吐: 112 tok/s<br>算力: 6.0 TFLOPS<br>加载: **13.7s (快 4.2 倍)** | **初始化与显存控制**：<br>• ColossalAI 初始化提速 **4.24 倍**<br>• 纯显存全量需多卡 FSDP 分片 |
 | **【预训练】单卡极限显存 (1×H20)** | **Qwen3.5-9B**<br>(8.95B, seq=1024) | **❌ OOM 崩溃**<br>(显存峰值需求 >97.9GB) | **⚠️ 勉强能跑**<br>吞吐: **236 tok/s**<br>算力: 12.7 TFLOPS<br>加载: 58.8s | **✅ 纯 GPU 满血跑通**<br>吞吐: **577~709 tok/s**<br>算力: **31.0~38.1 TFLOPS**<br>加载: **14.9s** (显存 90.1GB) | **ColossalAI 压倒性胜利**：<br>• 纯 GPU 唯一跑通方案<br>• 吞吐领先 **2.45 ~ 3.00 倍**<br>• 初始化提速 **4.0 倍** |
 | **【预训练】4 卡极限显存 (4×H20)** | **Qwen3.8-27B**<br>(26.90B, seq=512) | **❌ OOM 崩溃**<br>(显存峰值需求 >99.4GB) | **⚠️ 勉强能跑**<br>吞吐: **205 tok/s**<br>算力: 33.1 TFLOPS<br>加载: 123.4s | **✅ 纯 GPU 满血跑通**<br>吞吐: **856 tok/s**<br>算力: **138.1 TFLOPS**<br>加载: **13.0s** (显存 72.3GB) | **ColossalAI 压倒性胜利**：<br>• 吞吐领先 **4.18 倍 (超 317%)**<br>• 单步耗时 4.79s vs 15.9s<br>• 初始化加速 **9.5 倍** |
 | **【预训练】4 卡大模型 (4×H20)** | **gemma-4-31B**<br>(31.27B, seq=512) | **❌ OOM 崩溃**<br>(显存峰值需求 >96.1GB) | ⚠️ 严重受限 | **✅ 纯 GPU 满血跑通**<br>吞吐: **783~1050 tok/s**<br>算力: **146.9~197.0 TFLOPS**<br>显存仅 82.2GB | **承载更大参数**：<br>31B 稠密大模型在 4 卡下零 Offload 稳定训练 |
@@ -49,25 +51,36 @@
 
 ---
 
-## 3. 详细实验指标与数据日志
+## 3. 详细微调实验数据与指标汇总
 
-### 3.1 单卡微调实验（Full SFT vs LoRA PEFT）
+### 3.1 单卡微调实验（1×H20，Full SFT vs LoRA PEFT）
 
 - **3.1.1 单卡 27B 大模型 LoRA 微调 (1×H20, Qwen3.8-27B, seq=1024, r=16)**:
 
-| 评测维度 | DeepSpeed ZeRO-2 LoRA | ColossalAI LoRA SFT | 对比优势与结论 |
+| 评测维度 | DeepSpeed ZeRO-2 LoRA (纯 GPU) | DeepSpeed ZeRO-2 LoRA (CPU Offload) | ColossalAI LoRA SFT (纯 GPU 零 Offload) | 对比优势与结论 |
+|---|---|---|---|---|
+| **运行状态** | **❌ OOM 崩溃** (alloc >93.6GB) | **❌ OOM 崩溃** (梯度缓存超限) | **✅ 稳定跑通** | **ColossalAI 唯一可行方案** |
+| **可训练参数量** | 79.69M (0.296%) | 79.69M (0.296%) | 79.69M (0.296%) | 相同 LoRA 结构 |
+| **峰值显存 (Alloc)** | >93.6 GB (OOM) | >93.5 GB (OOM) | **55.6 GB** | **显存大幅富余 40.5 GB (42.2%)** |
+| **稳定吞吐 (token/s)** | 0 | 0 | **353 token/s** | 满血 GPU 计算 |
+| **稳定算力 (TFLOPS)** | 0 | 0 | **28.5 TFLOPS** | 算力利用充分 |
+| **单步耗时 (s/step)** | — | — | **5.76s** | 极速收敛 |
+| **加载与初始化 (s)** | 11.3s | 15.1s | **11.4s** | 极速初始化 |
+
+- **3.1.2 单卡 31B 稠密大模型 LoRA 微调 (1×H20, gemma-4-31B, seq=512, r=16)**:
+
+| 评测维度 | DeepSpeed ZeRO-2 LoRA (纯 GPU) | ColossalAI LoRA SFT (纯 GPU 零 Offload) | 对比优势与结论 |
 |---|---|---|---|
-| **运行状态** | **❌ OOM 崩溃** (alloc >93.6GB) | **✅ 稳定跑通** | **ColossalAI 唯一可行方案** |
-| **可训练参数量** | 79.69M (0.296%) | 79.69M (0.296%) | 相同 LoRA 结构 |
-| **峰值显存 (Alloc)** | >93.6 GB (OOM) | **55.6 GB** | **显存大幅富余 40.5 GB (42.2%)** |
-| **稳定吞吐 (token/s)** | 0 | **353 token/s** | 满血 GPU 计算 |
-| **稳定算力 (TFLOPS)** | 0 | **28.5 TFLOPS** | 算力利用充分 |
-| **单步耗时 (s/step)** | — | **5.76s** | 极速收敛 |
-| **加载与初始化 (s)** | 11.3s | **11.4s** | 极速初始化 |
+| **运行状态** | **✅ 跑通** | **✅ 跑通** | 两者均能跑通 |
+| **可训练参数量** | 122.43M (0.391%) | 122.43M (0.391%) | 相同 LoRA 结构 |
+| **峰值显存 (Alloc)** | **77.2 GB** | **62.9 GB** | **ColossalAI 节省 18.5% 显存 (省 14.3GB)** |
+| **稳定吞吐 (token/s)** | 693 token/s | 462 token/s | 吞吐均极高 |
+| **稳定算力 (TFLOPS)** | 65.1 TFLOPS | 43.4 TFLOPS | 算力利用充分 |
+| **加载与初始化 (s)** | 15.2s | 17.7s | 快速启动 |
 
-- **3.1.2 单卡 9B 模型 LoRA 微调 (1×H20, Qwen3.5-9B, seq=1024, r=16)**:
+- **3.1.3 单卡 9B 模型 LoRA 微调 (1×H20, Qwen3.5-9B, seq=1024, r=16)**:
 
-| 评测维度 | DeepSpeed ZeRO-2 LoRA | ColossalAI LoRA SFT | 对比优势与结论 |
+| 评测维度 | DeepSpeed ZeRO-2 LoRA (纯 GPU) | ColossalAI LoRA SFT (纯 GPU 零 Offload) | 对比优势与结论 |
 |---|---|---|---|
 | **运行状态** | **✅ 跑通** | **✅ 跑通** | 两者均能跑通 |
 | **可训练参数量** | 29.10M (0.325%) | 29.10M (0.325%) | 相同 LoRA 结构 |
@@ -75,26 +88,16 @@
 | **稳定吞吐 (token/s)** | 974 token/s | 704 token/s | 吞吐均极高 |
 | **加载与初始化 (s)** | 4.1s | 5.1s | 快速启动 |
 
----
+- **3.1.4 单卡 9B 模型全量参数微调 (1×H20, Qwen3.5-9B Full SFT, seq=512, CPU Offload 对比)**:
 
-### 3.2 单卡预训练极限显存评测系列（Qwen3.5-9B）
-
-| 序列长度 (seq_len) | DeepSpeed ZeRO-3 (纯 GPU) | DeepSpeed ZeRO-3 (CPU Offload) | ColossalAI FSDP (纯 GPU 零 Offload) | ColossalAI 胜出倍数 |
-|---|---|---|---|---|
-| **短序列 (seq=512)** | **❌ OOM 崩溃** (>97.6GB) | **⚠️ 123 tok/s** (6.6 TFLOPS) | **✅ 353~443 tok/s** (19.0~23.8 TFLOPS, 89.9GB) | **吞吐领先 2.87 ~ 3.60 倍** |
-| **中序列 (seq=1024)** | **❌ OOM 崩溃** (>97.9GB) | **⚠️ 236 tok/s** (12.7 TFLOPS) | **✅ 577~709 tok/s** (31.0~38.1 TFLOPS, 90.1GB) | **吞吐领先 2.45 ~ 3.00 倍** |
-| **长序列 (seq=2048)** | **❌ OOM 崩溃** | ⚠️ PCIe 延迟严重 | **✅ 715~806 tok/s** (38.4~43.3 TFLOPS, 90.6GB) | **显存增量仅 +0.7GB** |
-
----
-
-### 3.3 四卡与八卡分布式评测
-
-| 测试场景 | 模型 | DeepSpeed 表现 | ColossalAI 表现 | 优势结论 |
-|---|---|---|---|---|
-| **4 卡极限显存** | **Qwen3.8-27B** | 纯 GPU: **❌ OOM**<br>Offload: ⚠️ 205 tok/s | **✅ 纯 GPU 856 tok/s**<br>(显存 72.3GB) | **ColossalAI 领先 4.18 倍 (超 317%)** |
-| **4 卡大模型** | **gemma-4-31B** | 纯 GPU: **❌ OOM** | **✅ 纯 GPU 783~1050 tok/s**<br>(显存 82.2GB) | **31B 稠密大模型纯 GPU 稳定训练** |
-| **8 卡大 Batch (bs=2)** | **Qwen3.8-27B** | **❌ OOM 崩溃** | **✅ 稳定 2,264 tok/s**<br>(显存 66.4GB) | **激活显存扩展性极强 (增量仅 +0.8GB)** |
-| **8 卡常规 (bs=1)** | **Qwen3.8-27B** | 2,372 tok/s (74.6GB) | 2,039 tok/s (**65.6GB**) | **ColossalAI 省 12.1% 显存，启动快 47%** |
+| 评测维度 | DeepSpeed ZeRO-3 (CPU Offload) | ColossalAI FSDP (CPU Offload) | 对比优势与结论 |
+|---|---|---|---|
+| **运行状态** | **⚠️ 跑通** (纯 GPU OOM) | **✅ 跑通** (纯 GPU OOM) | 均借助 CPU Offload 突破单卡全量优化器瓶颈 |
+| **可训练参数量** | 8.95B (100% 全量) | 8.95B (100% 全量) | 8.95B 参数全部更新 |
+| **峰值显存 (Alloc)** | **20.0 GB** (Resv 23.5GB) | **57.9 GB** (Resv 63.2GB) | 显存均在 96GB 限制内 |
+| **稳定吞吐 (token/s)** | 163 token/s | 112 token/s | 受 PCIe CPU 搬运限制 |
+| **稳定算力 (TFLOPS)** | 8.8 TFLOPS | 6.0 TFLOPS | 算力受限 |
+| **初始化耗时 (s)** | **58.1s** | **13.7s** | **ColossalAI 初始化快 4.24 倍** |
 
 ---
 
@@ -112,7 +115,7 @@ export NCCL_NVLS_ENABLE=0
     --mode lora --lora-rank 16 --lora-alpha 32 \
     --steps 3 --seq-len 1024 --batch-size 1 --grad-accum 2
 
-# 1.2 DeepSpeed 单卡 27B LoRA 微调 (纯 GPU 直接 OOM 崩溃)
+# 1.2 DeepSpeed 单卡 27B LoRA 微调 (纯 GPU 与 ZeRO-2 Offload 均 OOM 崩溃)
 /home/qukaiming/deepspeed/.venv/bin/deepspeed --include localhost:3 --master_port=29510 \
     /home/qukaiming/deepspeed/ds_finetune.py \
     --model-dir /home/qukaiming/models/Qwen3.8-27B \
@@ -120,12 +123,32 @@ export NCCL_NVLS_ENABLE=0
     --mode lora --lora-rank 16 --lora-alpha 32 \
     --steps 3 --seq-len 1024 --batch-size 1 --grad-accum 2
 
-# 1.3 ColossalAI 单卡 9B LoRA 微调 (显存仅 20.9GB，省 45.7% 显存)
+# 1.3 ColossalAI 单卡 31B 稠密大模型 LoRA 微调 (显存仅 62.9GB，省 14.3GB 显存)
+/home/qukaiming/deepspeed/venv_colossalai/bin/torchrun --nproc_per_node=1 --master_port=29584 \
+    /home/qukaiming/deepspeed/colossalai_finetune.py \
+    --model-dir /home/qukaiming/models/gemma-4-31B \
+    --mode lora --lora-rank 16 --lora-alpha 32 \
+    --steps 3 --seq-len 512 --batch-size 1 --grad-accum 2
+
+# 1.4 ColossalAI 单卡 9B LoRA 微调 (显存仅 20.9GB，省 45.7% 显存)
 /home/qukaiming/deepspeed/venv_colossalai/bin/torchrun --nproc_per_node=1 --master_port=29581 \
     /home/qukaiming/deepspeed/colossalai_finetune.py \
     --model-dir /home/qukaiming/models/Qwen3.5-9B \
     --mode lora --lora-rank 16 --lora-alpha 32 \
     --steps 3 --seq-len 1024 --batch-size 1 --grad-accum 2
+
+# 1.5 DeepSpeed 与 ColossalAI 单卡 9B 全量 SFT CPU Offload 对比
+/home/qukaiming/deepspeed/.venv/bin/deepspeed --include localhost:3 --master_port=29510 \
+    /home/qukaiming/deepspeed/ds_finetune.py \
+    --model-dir /home/qukaiming/models/Qwen3.5-9B \
+    --ds-config /home/qukaiming/deepspeed/ds_config_zero3_offload.json \
+    --mode full --steps 3 --seq-len 512 --batch-size 1 --grad-accum 2
+
+/home/qukaiming/deepspeed/venv_colossalai/bin/torchrun --nproc_per_node=1 --master_port=29585 \
+    /home/qukaiming/deepspeed/colossalai_finetune.py \
+    --model-dir /home/qukaiming/models/Qwen3.5-9B \
+    --mode full --plugin fsdp --cpu-offload \
+    --steps 3 --seq-len 512 --batch-size 1 --grad-accum 2
 
 
 # ----------------- 2. 单卡预训练极限评测 -----------------

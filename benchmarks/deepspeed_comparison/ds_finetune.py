@@ -80,15 +80,8 @@ def main():
     else:
         vocab_size = getattr(cfg, "vocab_size", 152064)
 
-    is_zero3 = ds_cfg.get("zero_optimization", {}).get("stage", 0) == 3
-
-    if is_zero3:
-        with deepspeed.zero.Init(config_dict_or_path=ds_cfg):
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_dir, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_dir, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_dir, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True)
 
     if hasattr(model.config, "use_cache"):
         model.config.use_cache = False
@@ -97,7 +90,10 @@ def main():
 
     # ---------- Apply LoRA if mode == 'lora' ----------
     if args.mode == "lora":
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        if "gemma" in args.model_dir.lower():
+            target_modules = r".*language_model.*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+        else:
+            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=args.lora_rank,
