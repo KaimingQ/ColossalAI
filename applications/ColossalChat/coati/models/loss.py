@@ -205,14 +205,27 @@ class OddsRatioLoss(nn.Module):
         chosen_loss_mask: torch.Tensor,
         reject_loss_mask: torch.Tensor,
     ) -> torch.Tensor:
+        # Numerically stable ORPO odds-ratio loss (284B adaptation):
+        # log odds = logp - log(1 - exp(logp)) = logp - log1p(-exp(logp));
+        # log(sigmoid(x)) = -softplus(-x) = -logaddexp(0, -x), finite and
+        # bounded-gradient for any x (original log(sigmoid(x)) produces -inf
+        # once sigmoid saturates to 0 in bf16; the 1.0001 epsilon hack causes
+        # 1/(1.0001-exp(logp)) gradient spikes as logp -> 0).
         chosen_logp = chosen_logp.to(dtype=torch.float32)
         reject_logp = reject_logp.to(dtype=torch.float32)
-        chosen_odds = chosen_logp - torch.log(-torch.exp(chosen_logp) + 1.0001)
-        chosen_odds_masked = torch.sum(chosen_odds * chosen_loss_mask.float()) / torch.sum(chosen_loss_mask)
-        reject_odds = reject_logp - torch.log(-torch.exp(reject_logp) + 1.0001)
-        reject_odds_masked = torch.sum(reject_odds * reject_loss_mask.float()) / torch.sum(reject_loss_mask)
+        # NOTE: masked positions carry logp == 0 (calc_masked_log_probs multiplies the
+        # mask in), where log1p(-exp(logp)) = log(0) = -inf and the backward
+        # 1/(1-exp(logp)) divides by zero. Clamp logp to <= -1e-4: numerically safe,
+        # gradient bounded (~1e4, handled by grad clip); masked positions are zeroed
+        # out by the mask afterwards, so only near-probability-1 tokens are affected.
+        chosen_logp = chosen_logp.clamp(max=-1e-4)
+        reject_logp = reject_logp.clamp(max=-1e-4)
+        chosen_odds = chosen_logp - torch.log1p(-torch.exp(chosen_logp))
+        chosen_odds_masked = torch.sum(chosen_odds * chosen_loss_mask.float()) / torch.sum(chosen_loss_mask).clamp(min=1)
+        reject_odds = reject_logp - torch.log1p(-torch.exp(reject_logp))
+        reject_odds_masked = torch.sum(reject_odds * reject_loss_mask.float()) / torch.sum(reject_loss_mask).clamp(min=1)
         log_odds_ratio = chosen_odds_masked - reject_odds_masked
-        ratio = torch.log(torch.nn.functional.sigmoid(log_odds_ratio))
+        ratio = -torch.nn.functional.softplus(-log_odds_ratio)  # == log(sigmoid(log_odds_ratio)), stable
         return ratio.to(dtype=torch.bfloat16), log_odds_ratio
 
 

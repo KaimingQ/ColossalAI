@@ -141,22 +141,25 @@ class ORPOTrainer(SLTrainer):
                 reject_loss_mask = reject_loss_mask.fill_(1.0)
 
             batch_size = chosen_input_ids.size()[0]
+            # 不传 labels: 模型内部 CE 在 bf16 autocast 下大 logits 会溢出为 nan
+            # (284B 实测第 1 步即触发), 与 SimPO 路线一致, 由 fp32 logits 重算 chosen NLL
             actor_out = self.model(
                 input_ids=torch.cat([chosen_input_ids, reject_input_ids]),
                 attention_mask=torch.cat([chosen_attention_mask, reject_attention_mask]),
-                labels=torch.cat(
-                    [chosen_input_ids, torch.ones_like(reject_input_ids, dtype=reject_input_ids.dtype) * -100]
-                ),
             )
-            torch.autograd.set_detect_anomaly(True)
             actor_all_logits = actor_out["logits"].to(torch.float32)
             actor_chosen_logits = actor_all_logits[:batch_size]
             actor_reject_logits = actor_all_logits[batch_size:]
             logprob_actor_chosen = calc_masked_log_probs(actor_chosen_logits, chosen_input_ids, chosen_loss_mask[:, 1:])
 
             logprob_actor_reject = calc_masked_log_probs(actor_reject_logits, reject_input_ids, reject_loss_mask[:, 1:])
-            # label_chosen[chosen_loss_mask[:, 1:] == 0] = -100
-            chosen_nll = actor_out["loss"]
+            chosen_nll = torch.nn.functional.cross_entropy(
+                actor_chosen_logits[:, :-1].reshape(-1, actor_chosen_logits.size(-1)),
+                chosen_input_ids[:, 1:].reshape(-1),
+                reduction="none",
+            ).reshape(batch_size, -1)
+            cm1 = chosen_loss_mask[:, 1:]
+            chosen_nll = (chosen_nll * cm1).sum() / cm1.sum().clamp(min=1)
             odds_ratio_loss, log_odds_ratio = self.odds_ratio_loss_fn(
                 logprob_actor_chosen, logprob_actor_reject, chosen_loss_mask[:, 1:], reject_loss_mask[:, 1:]
             )
@@ -283,11 +286,7 @@ class ORPOTrainer(SLTrainer):
                 actor_out = self.model(
                     input_ids=torch.cat([chosen_input_ids, reject_input_ids]),
                     attention_mask=torch.cat([chosen_attention_mask, reject_attention_mask]),
-                    labels=torch.cat(
-                        [chosen_input_ids, torch.ones_like(reject_input_ids, dtype=reject_input_ids.dtype) * -100]
-                    ),
                 )
-                torch.autograd.set_detect_anomaly(True)
                 actor_all_logits = actor_out["logits"].to(torch.float32)
                 actor_chosen_logits = actor_all_logits[:batch_size]
                 actor_reject_logits = actor_all_logits[batch_size:]
@@ -298,7 +297,13 @@ class ORPOTrainer(SLTrainer):
                 logprob_actor_reject = calc_masked_log_probs(
                     actor_reject_logits, reject_input_ids, reject_loss_mask[:, 1:]
                 )
-                chosen_nll = actor_out["loss"]
+                chosen_nll = torch.nn.functional.cross_entropy(
+                    actor_chosen_logits[:, :-1].reshape(-1, actor_chosen_logits.size(-1)),
+                    chosen_input_ids[:, 1:].reshape(-1),
+                    reduction="none",
+                ).reshape(batch_size, -1)
+                cm1 = chosen_loss_mask[:, 1:]
+                chosen_nll = (chosen_nll * cm1).sum() / cm1.sum().clamp(min=1)
                 odds_ratio_loss, log_odds_ratio = self.odds_ratio_loss_fn(
                     logprob_actor_chosen, logprob_actor_reject, chosen_loss_mask[:, 1:], reject_loss_mask[:, 1:]
                 )

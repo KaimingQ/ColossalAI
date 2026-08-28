@@ -69,6 +69,22 @@ def train(args):
             cpu_offload=True,
             max_norm=args.grad_clip,
         )
+    elif args.plugin == "moe":
+        from colossalai.booster.plugin import MoeHybridParallelPlugin
+
+        plugin = MoeHybridParallelPlugin(
+            ep_size=args.ep,
+            tp_size=args.tp,
+            pp_size=args.pp,
+            zero_stage=args.zero_stage,
+            cpu_offload=args.zero_cpu_offload,
+            sp_size=args.sp,
+            sequence_parallelism_mode=args.sp_mode,
+            enable_sequence_parallelism=args.sp > 1,
+            max_norm=args.grad_clip,
+            precision=args.mixed_precision,
+            microbatch_size=args.microbatch_size,
+        )
     elif args.plugin == "3d":
         plugin = HybridParallelPlugin(
             tp_size=args.tp,
@@ -101,27 +117,45 @@ def train(args):
     )
     ref_booster = Booster(plugin=ref_plugin)
 
-    init_ctx = nullcontext()
+    # 284B 适配: 懒初始化构建空壳模型, 权重由 booster.load_model 低内存流式加载;
+    # 参考模型仅在未禁用时以同样方式构建 (大模型推荐 --disable_reference_model + SimPO)
+    from colossalai.lazy import LazyInitContext
+    from colossalai.utils import get_current_device
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(args.pretrain, trust_remote_code=True)
+    # 预热导入模型模块: 懒初始化内首次导入会因 `X | None` 注解求值崩溃 (同 lora_finetune)
+    _ = AutoModelForCausalLM._model_mapping[type(config)]
+    # DeepSeek-V4 head_dim=512 仅支持 eager 注意力
+    attn_impl = "eager" if config.model_type == "deepseek_v4" else ("flash_attention_2" if args.use_flash_attn else "eager")
+    # HybridParallel(3d) 与 Gemini 均支持懒初始化; zero2/ddp 直接物化
+    init_ctx = LazyInitContext(default_device=get_current_device()) if args.plugin in ("gemini", "3d", "moe") else nullcontext()
     with init_ctx:
-        if args.use_flash_attn:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.pretrain,
-                torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
-                use_flash_attention_2=True,
-            )
-            coordinator.print_on_master(msg="Flash-attention enabled successfully")
-        else:
-            model = AutoModelForCausalLM.from_pretrained(args.pretrain)
+        model = AutoModelForCausalLM.from_config(
+            config,
+            trust_remote_code=True,
+            attn_implementation=attn_impl,
+            torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
+        )
+        # transformers 5.x RotaryEmbedding 懒链自引用环修复 (同 lora_finetune)
+        from lora_finetune import _fix_lazy_rotary_buffers
+
+        _fix_lazy_rotary_buffers(model)
+
+        # moe 插件 EP 路线: 融合专家转逐专家布局 (逐专家键加载, 每 rank 持 1/ep)
+        if args.plugin == "moe" and args.ep > 1:
+            from colossalai.shardformer.modeling.deepseek_v4 import convert_fused_experts_to_modulelist
+
+            convert_fused_experts_to_modulelist(model)
 
         if not args.disable_reference_model:
-            if args.use_flash_attn:
-                ref_model = AutoModelForCausalLM.from_pretrained(
-                    args.pretrain,
+            with init_ctx:
+                ref_model = AutoModelForCausalLM.from_config(
+                    config,
+                    trust_remote_code=True,
+                    attn_implementation=attn_impl,
                     torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
-                    use_flash_attention_2=True,
                 )
-            else:
-                ref_model = AutoModelForCausalLM.from_pretrained(args.pretrain)
         else:
             ref_model = None
 
@@ -131,7 +165,8 @@ def train(args):
                 if "norm" in name or "gate" in name:
                     module = module.to(torch.float32)
         disable_dropout(model)
-        disable_dropout(ref_model)
+        if ref_model is not None:
+            disable_dropout(ref_model)
 
     if args.grad_checkpoint:
         # Make sure gradient checkpointing can be activated.
@@ -217,9 +252,16 @@ def train(args):
         lr_scheduler=lr_scheduler,
         dataloader=train_dataloader,
     )
-    ref_model, _, _, _, _ = ref_booster.boost(model=ref_model)
+    if ref_model is not None:
+        ref_model, _, _, _, _ = ref_booster.boost(model=ref_model)
 
     torch.set_default_dtype(torch.float)
+
+    # 低内存流式加载预训练权重 (284B bf16=568GB, 常规加载会 OOM)
+    coordinator.print_on_master(f"Loading pretrained weights from {args.pretrain} ...")
+    booster.load_model(model, args.pretrain, low_cpu_mem_mode=True, num_threads=8)
+    if ref_model is not None:
+        ref_booster.load_model(ref_model, args.pretrain, low_cpu_mem_mode=True, num_threads=8)
 
     coordinator.print_on_master(f"Booster init max CUDA memory: {torch.cuda.max_memory_allocated() / 1024 ** 2:.2f} MB")
     coordinator.print_on_master(
@@ -310,13 +352,14 @@ if __name__ == "__main__":
         "--plugin",
         type=str,
         default="gemini",
-        choices=["gemini", "zero2", "zero2_cpu", "3d", "ddp"],
+        choices=["gemini", "zero2", "zero2_cpu", "3d", "ddp", "moe"],
         help="Choose which plugin to use",
     )
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
     parser.add_argument("--warmup_steps", type=int, default=None, help="Warmup steps")
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--ep", type=int, default=1, help="EP size, used for moe plugin.")
     parser.add_argument("--pp", type=int, default=1)
     parser.add_argument("--sp", type=int, default=1)
     parser.add_argument("--loss_type", type=str, default="dpo_loss", help="dpo_loss or simpo_loss")

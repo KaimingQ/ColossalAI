@@ -1140,6 +1140,8 @@ def gather_state_dict_fast(
                 buffer = torch.empty(shape, dtype=dtype, device=get_current_device())
                 returned_state_dict[k] = buffer
                 ops.append(dist.P2POp(dist.irecv, buffer, dist.get_global_rank(group, i), group))
+            if not ops:
+                continue  # 该 rank 无专家状态 (如 LoRA 未注入路由专家), 两端对称跳过
             reqs = dist.batch_isend_irecv(ops)
             for req, (k, *_) in zip(reqs, target_metadata):
                 req.wait()
@@ -1150,6 +1152,7 @@ def gather_state_dict_fast(
         ops = []
         for k, *_ in metadata:
             ops.append(dist.P2POp(dist.isend, state_dict[k], dist.get_global_rank(group, dst), group))
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()

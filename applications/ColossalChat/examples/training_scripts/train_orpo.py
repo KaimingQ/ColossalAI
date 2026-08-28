@@ -79,6 +79,22 @@ def train(args):
             cpu_offload=True,
             max_norm=args.grad_clip,
         )
+    elif args.plugin == "moe":
+        from colossalai.booster.plugin import MoeHybridParallelPlugin
+
+        plugin = MoeHybridParallelPlugin(
+            ep_size=args.ep,
+            tp_size=args.tp,
+            pp_size=args.pp,
+            zero_stage=args.zero_stage,
+            cpu_offload=args.zero_cpu_offload,
+            sp_size=args.sp,
+            sequence_parallelism_mode=args.sp_mode,
+            enable_sequence_parallelism=args.sp > 1,
+            max_norm=args.grad_clip,
+            precision=args.mixed_precision,
+            microbatch_size=args.microbatch_size,
+        )
     elif args.plugin == "3d":
         plugin = HybridParallelPlugin(
             tp_size=args.tp,
@@ -106,17 +122,33 @@ def train(args):
     #     LazyInitContext(default_device=get_current_device()) if isinstance(plugin, (GeminiPlugin,)) else nullcontext()
     # )
 
-    init_ctx = nullcontext()
+    # 284B 适配: 懒初始化空壳 + booster.load_model 低内存流式加载 (同 train_dpo)
+    from colossalai.lazy import LazyInitContext
+    from colossalai.utils import get_current_device
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(args.pretrain, trust_remote_code=True)
+    # 预热导入模型模块: 懒初始化内首次导入会因 `X | None` 注解求值崩溃
+    _ = AutoModelForCausalLM._model_mapping[type(config)]
+    attn_impl = "eager" if config.model_type == "deepseek_v4" else ("flash_attention_2" if args.use_flash_attn else "eager")
+    init_ctx = LazyInitContext(default_device=get_current_device()) if args.plugin in ("gemini", "gemini_auto", "3d", "moe") else nullcontext()
     with init_ctx:
-        if args.use_flash_attn:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.pretrain,
-                torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
-                use_flash_attention_2=True,
-            )
-            coordinator.print_on_master(msg="Flash-attention enabled successfully")
-        else:
-            model = AutoModelForCausalLM.from_pretrained(args.pretrain)
+        model = AutoModelForCausalLM.from_config(
+            config,
+            trust_remote_code=True,
+            attn_implementation=attn_impl,
+            torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
+        )
+        from lora_finetune import _fix_lazy_rotary_buffers
+
+        _fix_lazy_rotary_buffers(model)
+
+        # moe 插件 EP 路线: 融合专家转逐专家布局 (逐专家键加载, 每 rank 持 1/ep)
+        if args.plugin == "moe" and args.ep > 1:
+            from colossalai.shardformer.modeling.deepseek_v4 import convert_fused_experts_to_modulelist
+
+            convert_fused_experts_to_modulelist(model)
+
         if args.lora_config is not None:
             model = convert_to_lora_module(model, lora_config=lora_config)
             for name, module in model.named_modules():
@@ -207,6 +239,10 @@ def train(args):
     )
     torch.set_default_dtype(torch.float)
 
+    # 低内存流式加载预训练权重 (284B bf16=568GB)
+    coordinator.print_on_master(f"Loading pretrained weights from {args.pretrain} ...")
+    booster.load_model(model, args.pretrain, low_cpu_mem_mode=True, num_threads=8)
+
     coordinator.print_on_master(f"Booster init max CUDA memory: {torch.cuda.max_memory_allocated() / 1024 ** 2:.2f} MB")
     coordinator.print_on_master(
         f"Booster init max CPU memory: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.2f} MB"
@@ -293,13 +329,15 @@ if __name__ == "__main__":
         "--plugin",
         type=str,
         default="gemini",
-        choices=["gemini", "gemini_auto", "zero2", "zero2_cpu", "3d"],
+        choices=["gemini", "gemini_auto", "zero2", "zero2_cpu", "3d", "moe"],
         help="Choose which plugin to use",
     )
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
     parser.add_argument("--warmup_steps", type=int, default=None, help="Warmup steps")
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--ep", type=int, default=1, help="EP size, used for moe plugin.")
+    parser.add_argument("--microbatch_size", type=int, default=1, help="Microbatch size for PP, used for 3d/moe plugin.")
     parser.add_argument("--pp", type=int, default=1)
     parser.add_argument("--sp", type=int, default=1)
     parser.add_argument("--lam", type=float, default=0.1, help="lambda in ORPO loss")

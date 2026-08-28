@@ -174,6 +174,13 @@ _POLICY_LIST = {
     "transformers_modules.modeling_deepseek.DeepseekV3ForCausalLM": PolicyLocation(
         file_name="deepseek_v3", class_name="DeepseekV3ForCausalLMPolicy"
     ),
+    # DeepseekV4 (native in transformers >= 5.x)
+    "transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Model": PolicyLocation(
+        file_name="deepseek_v4", class_name="DeepseekV4ModelPolicy"
+    ),
+    "transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4ForCausalLM": PolicyLocation(
+        file_name="deepseek_v4", class_name="DeepseekV4ForCausalLMPolicy"
+    ),
     # Falcon
     "transformers.models.falcon.modeling_falcon.FalconModel": PolicyLocation(
         file_name="falcon", class_name="FalconModelPolicy"

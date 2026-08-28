@@ -367,6 +367,8 @@ def apply_chat_template_and_mask(
     }
 
     # Format for RL.
+    gt_answer = None
+    test_cases = None
     if "messages" in chat:
         gt_answer = chat.get("gt_answer", None)
         test_cases = chat.get("test_cases", None)
@@ -375,7 +377,13 @@ def apply_chat_template_and_mask(
     tokens = []
     assistant_mask = []
     for i, msg in enumerate(chat):
-        msg_tokens = tokenizer.apply_chat_template([system_element, msg], tokenize=True, add_generation_prompt=True)
+        # transformers 5.x (TokenizersBackend) 默认返回 BatchEncoding, 需 return_dict 取 input_ids;
+        # 旧版直接返回 id 列表, 做兼容处理
+        _tpl_out = tokenizer.apply_chat_template(
+            [system_element, msg], tokenize=True, add_generation_prompt=True, return_dict=True
+        )
+        # transformers 5.x 的 BatchEncoding 不再继承 dict, 用鸭子类型判断
+        msg_tokens = _tpl_out["input_ids"] if hasattr(_tpl_out, "keys") and "input_ids" in _tpl_out else _tpl_out
         # remove unexpected bos token
         if i > 0 and msg_tokens[0] == tokenizer.bos_token_id:
             msg_tokens = msg_tokens[1:]

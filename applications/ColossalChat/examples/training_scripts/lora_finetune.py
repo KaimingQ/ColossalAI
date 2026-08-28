@@ -36,6 +36,30 @@ from colossalai.nn.optimizer import HybridAdam
 from colossalai.utils import get_current_device
 
 
+def _fix_lazy_rotary_buffers(model) -> None:
+    """重建 RotaryEmbedding 的 inv_freq 类 buffer, 消除懒初始化自引用环。
+
+    transformers 5.x 的 RotaryEmbedding.__init__ 用 rope 初始化函数计算 inv_freq 并
+    `clone()` 出 original_inv_freq, 在 LazyInitContext 下形成自引用懒链, 物化时无限递归。
+    这些 buffer 均为 persistent=False (不存在于 checkpoint), 在 CPU 上重新构造同配置实例
+    并拷贝其 buffer 即可, 数值与官方实现完全一致。
+    """
+    from colossalai.lazy.lazy_init import LazyTensor
+
+    for _, mod in model.named_modules():
+        if not mod.__class__.__name__.endswith("RotaryEmbedding"):
+            continue
+        lazy_bufs = [n for n, b in mod.named_buffers() if isinstance(b, LazyTensor)]
+        if not lazy_bufs:
+            continue
+        with torch.device("cpu"):
+            fresh = mod.__class__(mod.config)
+        for n in lazy_bufs:
+            v = getattr(fresh, n, None)
+            if v is not None:
+                mod.register_buffer(n, v, persistent=False)
+
+
 def all_reduce_mean(loss: torch.Tensor, plugin: Plugin) -> torch.Tensor:
     loss = loss.data
     group = getattr(plugin, "dp_group", None)
@@ -111,6 +135,7 @@ def train(args) -> None:
             tp_size=args.tp,
             pp_size=args.pp,
             zero_stage=args.zero_stage,
+            cpu_offload=args.zero_cpu_offload,
             sp_size=args.sp,
             sequence_parallelism_mode=args.sp_mode,
             enable_sequence_parallelism=args.sp > 1,
@@ -157,6 +182,7 @@ def train(args) -> None:
         tokenizer,
         args.dataset,
         args.max_length,
+        args.system_prompt,
     )
 
     dataloader = plugin.prepare_dataloader(
@@ -179,9 +205,12 @@ def train(args) -> None:
         if isinstance(plugin, (GeminiPlugin, HybridParallelPlugin))
         else nullcontext()
     )
-    attn_impl = "eager" if get_accelerator().name == "npu" else "flash_attention_2"
-
     config = AutoConfig.from_pretrained(args.pretrained, trust_remote_code=True)
+    # DeepSeek-V4 的 head_dim=512 超出 FlashAttention 上限, 仅支持 eager 注意力
+    attn_impl = "eager" if (get_accelerator().name == "npu" or config.model_type == "deepseek_v4") else "flash_attention_2"
+    # 预热导入模型模块: LazyInitContext 会包装 torch 工厂函数, 若模型类在懒初始化内
+    # 首次导入, 其函数签名注解 (torch.LongTensor | None) 求值会崩溃 (transformers 5.x)
+    _ = AutoModelForCausalLM._model_mapping[type(config)]
 
     with init_ctx:
         # from_pretrained is not compatible with LoRA, we load pretrained weights later.
@@ -198,6 +227,18 @@ def train(args) -> None:
             torch_dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float16,
         )
 
+        # DeepSeek-V4: 融合 3D 专家张量转为逐专家 ModuleList (需在懒初始化内),
+        # 配合逐专家键的 checkpoint (见仓库脚本 split_experts_per_key.py),
+        # 使专家并行下每个 rank 只加载/保存 1/ep 的专家
+        if config.model_type == "deepseek_v4" and args.plugin == "moe" and args.ep > 1:
+            from colossalai.shardformer.modeling.deepseek_v4 import convert_fused_experts_to_modulelist
+
+            convert_fused_experts_to_modulelist(model)
+
+        # transformers 5.x 的 RotaryEmbedding 在懒初始化下会形成自引用懒链
+        # (inv_freq = f(self.original_inv_freq)), 物化时无限递归; 直接重建为具体值
+        _fix_lazy_rotary_buffers(model)
+
         if args.lora_rank > 0:
             if model.__class__.__name__.startswith("DeepseekV3"):
                 lora_config = LoraConfig(
@@ -205,6 +246,18 @@ def train(args) -> None:
                     r=args.lora_rank,
                     lora_alpha=args.lora_alpha,
                     target_modules=["gate_proj", "up_proj", "down_proj"],
+                )
+            elif model.__class__.__name__.startswith("DeepseekV4"):
+                # V4 路由专家为融合 3D 参数 (非 nn.Linear), 无法注入 LoRA;
+                # 对 MLA 注意力线性层与共享专家注入 (gate/up/down_proj 仅命中 shared_experts)。
+                # 注: o_a_proj 为 GroupedLinear (输入为 5D 分组张量), PEFT LoRA 的秩推断与
+                # 加法残差不兼容, 故排除; o_b_proj 覆盖输出投影的适配能力
+                lora_config = LoraConfig(
+                    task_type="CAUSAL_LM",
+                    r=args.lora_rank,
+                    lora_alpha=args.lora_alpha,
+                    target_modules=["q_a_proj", "q_b_proj", "kv_proj", "o_b_proj",
+                                    "gate_proj", "up_proj", "down_proj"],
                 )
             else:
                 lora_config = LoraConfig(task_type="CAUSAL_LM", r=args.lora_rank, lora_alpha=args.lora_alpha)
@@ -257,7 +310,7 @@ def train(args) -> None:
     )
 
     torch.set_default_dtype(torch.float)
-    booster.load_model(model, args.pretrained, low_cpu_mem_mode=False, num_threads=8)
+    booster.load_model(model, args.pretrained, low_cpu_mem_mode=args.low_cpu_mem, num_threads=8)
 
     coordinator.print_on_master(
         f"Booster init max device memory: {accelerator.max_memory_allocated() / 1024 ** 2:.2f} MB"
@@ -441,6 +494,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--zero_cpu_offload", default=False, action="store_true", help="Whether to use offloading, used for 3d plugin."
     )
+    parser.add_argument(
+        "--low_cpu_mem",
+        default=False,
+        action="store_true",
+        help="Stream-load checkpoint to keep peak CPU memory low (required for 284B+ models).",
+    )
+    parser.add_argument("--system_prompt", type=str, default="", help="System prompt prepended to conversations.")
+    parser.add_argument("--use_fp8", default=False, action="store_true", help="Enable FP8 mixed-precision training (moe plugin).")
     parser.add_argument(
         "--microbatch_size", type=int, default=1, help="Batch size for each process in PP, used for 3d plugin."
     )
