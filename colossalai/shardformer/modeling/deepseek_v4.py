@@ -253,8 +253,13 @@ class EpDeepseekV4MoE(ParallelModule):
 
         if self.ep_size > 1:
             local_out = EPGradScalerOut.apply(local_out, self.ep_size)
+            # local_order 将接收序列按本地专家分组计算, 回传前必须做逆置换恢复接收顺序;
+            # 否则源 rank 收到错位的专家输出 (token 拿到别的专家的结果), 训练 loss 会异常偏高。
+            # 参照 EpDeepseekV3MoE 的 new_x[gatherd_idxs] = outs 还原逻辑。
+            unsorted = torch.empty_like(local_out)
+            unsorted[local_order] = local_out
             # combine: scatter results back to source ranks (与 dispatch 相反的拆分)
-            combined, _ = all_to_all_uneven(local_out, recv_splits, send_splits, self.ep_group)
+            combined, _ = all_to_all_uneven(unsorted, recv_splits, send_splits, self.ep_group)
             # combined 已恢复为 sorted-token 顺序, 按路由权重加权
             w = top_k_weights.reshape(-1)[sort_order]
             final_sorted = combined * w[:, None]
