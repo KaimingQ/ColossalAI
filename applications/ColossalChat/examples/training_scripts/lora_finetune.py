@@ -60,11 +60,46 @@ def _fix_lazy_rotary_buffers(model) -> None:
                 mod.register_buffer(n, v, persistent=False)
 
 
+def _keep_strict_fp32(model) -> None:
+    """复现 HF from_pretrained 的 _keep_in_fp32_modules_strict 精度策略。
+
+    from_config 按传入 dtype 创建全部参数, 而 checkpoint 中 hc/sinks/norm 等
+    敏感模块以 fp32 存储; bf16 量化会引入可观测的数值偏移 (实测基线 NLL 0.8
+    变为 6+)。此处将这些参数/buffer 重建为 fp32 懒张量, 后续加载保持无损。
+    """
+    keywords = getattr(model, "_keep_in_fp32_modules_strict", None)
+    if not keywords:
+        return
+
+    def keep_fp32(name: str) -> bool:
+        return any(name == kw or name.endswith("." + kw) for kw in keywords)
+
+    for n, mod in model.named_modules():
+        for pname, p in list(mod.named_parameters(recurse=False)):
+            full = f"{n}.{pname}" if n else pname
+            if keep_fp32(full) and p.dtype != torch.float32:
+                setattr(mod, pname, torch.nn.Parameter(
+                    torch.empty(p.shape, dtype=torch.float32, device=p.device),
+                    requires_grad=p.requires_grad,
+                ))
+        for bname, b in list(mod.named_buffers(recurse=False)):
+            full = f"{n}.{bname}" if n else bname
+            if keep_fp32(full) and b is not None and b.dtype != torch.float32:
+                mod.register_buffer(
+                    bname,
+                    torch.empty(b.shape, dtype=torch.float32, device=b.device),
+                    persistent=(bname not in mod._non_persistent_buffers_set),
+                )
+
+
 def all_reduce_mean(loss: torch.Tensor, plugin: Plugin) -> torch.Tensor:
     loss = loss.data
     group = getattr(plugin, "dp_group", None)
     dist.all_reduce(loss, group=group)
-    return loss / dist.get_world_size(group)
+    # 原地除以组大小: 调用方 (如 SFT 分支) 直接复用该张量, 若只返回商不原地除,
+    # 报告的 loss 会误为全组之和 (曾导致报告值偏大 world_size 倍)
+    loss.div_(dist.get_world_size(group))
+    return loss
 
 
 def train(args) -> None:
@@ -74,6 +109,7 @@ def train(args) -> None:
     colossalai.launch_from_torch()
     accelerator = get_accelerator()
     coordinator = DistCoordinator()
+    fused_norm = accelerator.is_available() and not args.no_fused_norm
 
     # ==============================
     # Initialize Booster
@@ -86,7 +122,7 @@ def train(args) -> None:
             initial_scale=2**16,
             max_norm=args.grad_clip,
             enable_gradient_accumulation=(args.accumulation_steps > 1),
-            enable_fused_normalization=get_accelerator().is_available(),
+            enable_fused_normalization=fused_norm,
             enable_flash_attention=args.use_flash_attn,
         )
     elif args.plugin == "gemini_auto":
@@ -96,7 +132,7 @@ def train(args) -> None:
             initial_scale=2**16,
             max_norm=args.grad_clip,
             enable_gradient_accumulation=(args.accumulation_steps > 1),
-            enable_fused_normalization=get_accelerator().is_available(),
+            enable_fused_normalization=fused_norm,
             enable_flash_attention=args.use_flash_attn,
         )
     elif args.plugin == "zero2":
@@ -122,7 +158,7 @@ def train(args) -> None:
             sequence_parallelism_mode=args.sp_mode,
             zero_stage=args.zero_stage,
             enable_flash_attention=args.use_flash_attn,
-            enable_fused_normalization=get_accelerator().is_available(),
+            enable_fused_normalization=fused_norm,
             enable_sequence_parallelism=args.enable_sequence_parallelism,
             cpu_offload=True if args.zero_stage >= 1 and args.zero_cpu_offload else False,
             max_norm=args.grad_clip,
@@ -139,7 +175,7 @@ def train(args) -> None:
             sp_size=args.sp,
             sequence_parallelism_mode=args.sp_mode,
             enable_sequence_parallelism=args.sp > 1,
-            enable_fused_normalization=get_accelerator().is_available(),
+            enable_fused_normalization=fused_norm,
             enable_flash_attention=args.use_flash_attn,
             max_norm=args.grad_clip,
             precision=args.mixed_precision,
@@ -238,6 +274,11 @@ def train(args) -> None:
         # transformers 5.x 的 RotaryEmbedding 在懒初始化下会形成自引用懒链
         # (inv_freq = f(self.original_inv_freq)), 物化时无限递归; 直接重建为具体值
         _fix_lazy_rotary_buffers(model)
+
+        # HF 精度策略复现: hc/sinks/norm 等敏感模块保持 fp32 (checkpoint 以 fp32 存储,
+        # bf16 量化会导致训练 loss 异常偏高)
+        if args.mixed_precision == "bf16":
+            _keep_strict_fp32(model)
 
         if args.lora_rank > 0:
             if model.__class__.__name__.startswith("DeepseekV3"):
@@ -502,6 +543,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--system_prompt", type=str, default="", help="System prompt prepended to conversations.")
     parser.add_argument("--use_fp8", default=False, action="store_true", help="Enable FP8 mixed-precision training (moe plugin).")
+    parser.add_argument(
+        "--no_fused_norm", default=False, action="store_true", help="Disable FusedRMSNorm replacement (debug)."
+    )
     parser.add_argument(
         "--microbatch_size", type=int, default=1, help="Batch size for each process in PP, used for 3d plugin."
     )
