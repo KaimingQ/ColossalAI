@@ -11,6 +11,8 @@
 
 from typing import Optional
 
+import gc
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -165,11 +167,11 @@ class EpDeepseekV4MoE(ParallelModule):
         调用前需先由 fuse_v4_local_experts 清理 optimizer/ZeRO 对原参数的引用。
         """
         if getattr(self, "fused_gate_up", None) is not None:
-            return set()
+            return False
         if self.ep_size <= 1 or self.moe_dp_size != 1:
-            return set()
+            return False
         if not hasattr(torch, "_grouped_mm"):
-            return set()
+            return False
         held = [
             self.experts.experts[i]
             for i in range(self.expert_start_idx, self.expert_start_idx + self.num_experts_per_ep)
@@ -214,7 +216,7 @@ class EpDeepseekV4MoE(ParallelModule):
         (bf16 16B 对齐), 故将每组 pad 到 8 倍数 (平均 ~11% 冗余计算, 远小于
         逐专家小 GEMM 的效率损失与 launch 开销); pad/unpad 全部 GPU 向量化, 无额外同步。"""
         device = gathered.device
-        num_local = gathered.shape[0]
+        num_rows = gathered.shape[0]
         counts = torch.tensor(local_counts_list, dtype=torch.int64, device=device)
         counts_pad = (counts + 7) // 8 * 8
         total_pad = sum((n + 7) // 8 * 8 for n in local_counts_list)  # CPU 侧已知, 免同步
@@ -226,7 +228,7 @@ class EpDeepseekV4MoE(ParallelModule):
         )
         orig_start = torch.cumsum(counts, 0) - counts
         pad_start = offs_pad.long() - counts_pad
-        dst = pad_start[seg_id] + (torch.arange(num_local, device=device) - orig_start[seg_id])
+        dst = pad_start[seg_id] + (torch.arange(num_rows, device=device) - orig_start[seg_id])
 
         pad = gathered.new_zeros(total_pad, gathered.shape[-1])
         pad[dst] = gathered
@@ -406,8 +408,8 @@ def _strip_freed_params(container, freed_ids, seen) -> None:
             stale_keys = [k for k, v in attr.items() if id(k) in freed_ids or id(v) in freed_ids]
             for k in stale_keys:
                 del attr[k]
-    for attr in ("optim", "optimizer"):
-        inner = getattr(container, attr, None)
+    for inner_name in ("optim", "optimizer"):
+        inner = getattr(container, inner_name, None)
         if inner is not None and inner is not container:
             _strip_freed_params(inner, freed_ids, seen)
 
@@ -431,8 +433,6 @@ def fuse_v4_local_experts(model: nn.Module, optimizer=None) -> int:
     for m in blocks:
         if m.fuse_local_experts():
             n += 1
-    import gc
-
     gc.collect()  # 回收残余的自引用环 (tolist 绑定方法等)
     torch.cuda.empty_cache()
     return n

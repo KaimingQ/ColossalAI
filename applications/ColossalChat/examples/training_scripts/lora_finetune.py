@@ -361,7 +361,9 @@ def train(args) -> None:
 
     # DeepSeek-V4 EP: 权重就绪后将本地专家融合为 grouped GEMM 布局 (Megatron TEGroupedMLP 思路),
     # 消除逐专家小 GEMM 的 kernel launch 风暴; 仅 adapter 保存路径适用 (fused buffer 不进 state_dict)
-    if config.model_type == "deepseek_v4" and args.plugin == "moe" and args.ep > 1:
+    # 注意: 仅 LoRA (只保存 adapter) 适用; 非 LoRA 走 save_model 全量保存,
+    # fused buffer 不进 state_dict 会丢专家权重
+    if config.model_type == "deepseek_v4" and args.plugin == "moe" and args.ep > 1 and args.lora_rank > 0:
         from colossalai.shardformer.modeling.deepseek_v4 import fuse_v4_local_experts
 
         n_fused = fuse_v4_local_experts(model, optimizer)
