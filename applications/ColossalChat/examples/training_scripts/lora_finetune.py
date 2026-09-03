@@ -244,6 +244,12 @@ def train(args) -> None:
     config = AutoConfig.from_pretrained(args.pretrained, trust_remote_code=True)
     # DeepSeek-V4 的 head_dim=512 超出 FlashAttention 上限, 仅支持 eager 注意力
     attn_impl = "eager" if (get_accelerator().name == "npu" or config.model_type == "deepseek_v4") else "flash_attention_2"
+    if config.model_type == "deepseek_v4":
+        # head_dim=512 无法走 SDPA/FA, eager 路径换提速等价实现
+        # (MQA 广播免 64 倍 repeat_kv 拷贝 + sinks 融合进 softmax, 数值与 HF eager 一致)
+        from colossalai.shardformer.modeling.deepseek_v4 import install_v4_fast_attention
+
+        install_v4_fast_attention()
     # 预热导入模型模块: LazyInitContext 会包装 torch 工厂函数, 若模型类在懒初始化内
     # 首次导入, 其函数签名注解 (torch.LongTensor | None) 求值会崩溃 (transformers 5.x)
     _ = AutoModelForCausalLM._model_mapping[type(config)]
@@ -353,6 +359,14 @@ def train(args) -> None:
     torch.set_default_dtype(torch.float)
     booster.load_model(model, args.pretrained, low_cpu_mem_mode=args.low_cpu_mem, num_threads=8)
 
+    # DeepSeek-V4 EP: 权重就绪后将本地专家融合为 grouped GEMM 布局 (Megatron TEGroupedMLP 思路),
+    # 消除逐专家小 GEMM 的 kernel launch 风暴; 仅 adapter 保存路径适用 (fused buffer 不进 state_dict)
+    if config.model_type == "deepseek_v4" and args.plugin == "moe" and args.ep > 1:
+        from colossalai.shardformer.modeling.deepseek_v4 import fuse_v4_local_experts
+
+        n_fused = fuse_v4_local_experts(model, optimizer)
+        coordinator.print_on_master(f"[perf] fused local experts for grouped GEMM: {n_fused} MoE blocks")
+
     coordinator.print_on_master(
         f"Booster init max device memory: {accelerator.max_memory_allocated() / 1024 ** 2:.2f} MB"
     )
@@ -413,6 +427,42 @@ def train(args) -> None:
                 initial=start_step // args.accumulation_steps,
             )
             total_loss = torch.tensor(0.0, device=get_current_device())
+
+            # 吞吐 profile: PROFILE_STEPS>0 时采集 wait=1/warmup=2/active=N 窗口,
+            # rank0 导出 chrome trace, 全 rank 打印 kernel/算子耗时表, 采完提前退出
+            prof = None
+            prof_done = False
+            profile_steps = int(os.environ.get("PROFILE_STEPS", "0"))
+            if profile_steps > 0:
+                from torch.profiler import ProfilerActivity
+                from torch.profiler import profile as torch_profile
+                from torch.profiler import schedule as prof_schedule
+
+                prof_rank = dist.get_rank()
+                prof_dir = os.environ.get("PROFILE_OUT", "logs/profile")
+                if prof_rank == 0:
+                    os.makedirs(prof_dir, exist_ok=True)
+
+                def _prof_ready(p):
+                    if prof_rank == 0:
+                        p.export_chrome_trace(os.path.join(prof_dir, f"trace_rank{prof_rank}.json"))
+                    print(
+                        f"[profile rank{prof_rank}] top self-CUDA kernels:\n"
+                        + p.key_averages().table(sort_by="self_cuda_time_total", row_limit=35),
+                        flush=True,
+                    )
+                    print(
+                        f"[profile rank{prof_rank}] top self-CPU ops:\n"
+                        + p.key_averages().table(sort_by="self_cpu_time_total", row_limit=25),
+                        flush=True,
+                    )
+
+                prof = torch_profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    schedule=prof_schedule(wait=1, warmup=2, active=profile_steps, repeat=1),
+                    on_trace_ready=_prof_ready,
+                )
+                prof.start()
             for step, batch in enumerate(pbar, start=start_step // args.accumulation_steps):
                 batch = {k: v.to(get_current_device()) for k, v in batch.items() if isinstance(v, torch.Tensor)}
 
@@ -444,6 +494,24 @@ def train(args) -> None:
                     optimizer.zero_grad()
 
                     total_loss.fill_(0.0)
+
+                if prof is not None:
+                    prof.step()
+                    if step + 1 >= 3 + profile_steps:
+                        # wait+warmup+active 窗口采集完成, 全 rank 同步提前退出
+                        prof.stop()
+                        prof_done = True
+                        coordinator.print_on_master("[profile] window captured, exiting training early")
+                        break
+
+            if prof is not None and not prof_done:
+                # dataloader 耗尽但窗口未采满: 强制导出已采集部分
+                prof.stop()
+                _prof_ready(prof)
+                prof_done = True
+
+        if prof_done:
+            break
 
         # Delete cache.
         # del batch, batch_labels, batch_output, loss

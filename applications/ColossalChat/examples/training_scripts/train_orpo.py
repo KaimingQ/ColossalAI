@@ -131,6 +131,11 @@ def train(args):
     # 预热导入模型模块: 懒初始化内首次导入会因 `X | None` 注解求值崩溃
     _ = AutoModelForCausalLM._model_mapping[type(config)]
     attn_impl = "eager" if config.model_type == "deepseek_v4" else ("flash_attention_2" if args.use_flash_attn else "eager")
+    if config.model_type == "deepseek_v4":
+        # head_dim=512 无法走 SDPA/FA, eager 路径换提速等价实现 (MQA 广播 + sinks 融合 softmax)
+        from colossalai.shardformer.modeling.deepseek_v4 import install_v4_fast_attention
+
+        install_v4_fast_attention()
     init_ctx = LazyInitContext(default_device=get_current_device()) if args.plugin in ("gemini", "gemini_auto", "3d", "moe") else nullcontext()
     with init_ctx:
         model = AutoModelForCausalLM.from_config(
@@ -242,6 +247,12 @@ def train(args):
     # 低内存流式加载预训练权重 (284B bf16=568GB)
     coordinator.print_on_master(f"Loading pretrained weights from {args.pretrain} ...")
     booster.load_model(model, args.pretrain, low_cpu_mem_mode=True, num_threads=8)
+    # DeepSeek-V4 EP 优化: grouped GEMM 专家布局 (保存前由 unfuse 还原)
+    if config.model_type == "deepseek_v4" and args.plugin == "moe" and args.ep > 1:
+        from colossalai.shardformer.modeling.deepseek_v4 import fuse_v4_local_experts
+
+        n_fused = fuse_v4_local_experts(model, optim)
+        coordinator.print_on_master(f"[perf] fused local experts for grouped GEMM: {n_fused} MoE blocks")
 
     coordinator.print_on_master(f"Booster init max CUDA memory: {torch.cuda.max_memory_allocated() / 1024 ** 2:.2f} MB")
     coordinator.print_on_master(
@@ -312,6 +323,10 @@ def train(args):
     # save model checkpoint after fitting on only rank0
     if args.save_dir is not None:
         coordinator.print_on_master("Start saving final model checkpoint")
+    if config.model_type == "deepseek_v4" and args.plugin == "moe" and args.ep > 1:
+        from colossalai.shardformer.modeling.deepseek_v4 import unfuse_v4_local_experts
+
+        unfuse_v4_local_experts(model)  # 还原逐专家布局以兼容 EP 分片 state_dict
         booster.save_model(model, os.path.join(args.save_dir, "modeling"), shard=True)
         coordinator.print_on_master(
             f"Saved final model checkpoint at epoch {args.max_epochs} at folder {args.save_dir}"
